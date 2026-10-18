@@ -14,6 +14,7 @@
 // plug-in wrapper and the offline tests both run exactly this code.
 //==============================================================================
 
+#include "Effects.h"
 #include "GridScheduler.h"
 #include "Pattern.h"
 #include "StutterEngine.h"
@@ -30,6 +31,12 @@ namespace gn
 constexpr int kNumQuants = 5;
 constexpr const char* kQuantNames[kNumQuants] = { "Off", "1/16", "1/8", "1/4", "1 Bar" };
 constexpr double kQuantPpq[kNumQuants] = { 0.0, 0.25, 0.5, 1.0, -1.0 /* one bar */ };
+
+// Delay times (tempo-synced).
+constexpr int kNumDelayTimes = 11;
+constexpr const char* kDelayTimeNames[kNumDelayTimes] = { "1/32", "1/16T", "1/16", "1/16D", "1/8T", "1/8", "1/8D", "1/4T", "1/4", "1/4D", "1/2" };
+constexpr double kDelayTimePpq[kNumDelayTimes] = { 0.125, 1.0 / 6.0, 0.25, 0.375, 1.0 / 3.0, 0.5, 0.75, 2.0 / 3.0, 1.0, 1.5, 2.0 };
+constexpr int kDefaultDelayTime = 6; // 1/8D
 
 // MIDI map
 constexpr int kLiveNoteBase = 60;    // C3 (middle C) .. A#3: hold to glitch with type 0..10
@@ -52,6 +59,16 @@ struct CoreParams
     bool engage = true;        // pattern on/off (live notes/pads always work)
     int liveDivision = kDiv16; // repeat length for live notes/pads
     int liveQuant = 1;         // index into kQuantPpq
+
+    // Global crusher (on everything): amounts 0..1 like the per-step ones.
+    float crushBits = 0.0f, crushRate = 0.0f, crushMix = 0.0f;
+
+    // Delay / reverb. Source 0 = glitches only (each step's Send), 1 = everything.
+    int fxSource = 0;
+    int delayTime = kDefaultDelayTime;
+    float delayFeedback = 0.45f, delayTone = -0.2f, delayMix = 0.0f;
+    bool delayPingPong = true;
+    float reverbSize = 0.55f, reverbDamp = 0.4f, reverbMix = 0.0f;
 };
 
 struct HostTime
@@ -73,10 +90,18 @@ public:
     static constexpr double kBufferSeconds = 10.0; // how far back the engine can reach
     static constexpr int kMaxHeld = 16;
 
+    static constexpr int kMaxChunk = 1024; // longer host blocks are processed in pieces
+
     void prepare (double sampleRate, int numChannels)
     {
         sr = sampleRate;
+        channels = std::clamp (numChannels, 1, 2);
         engine.prepare (numChannels, sampleRate, kBufferSeconds);
+        delay.prepare (sampleRate, 6.5);
+        reverb.prepare (sampleRate);
+        for (auto* v : { &sendBuf, &delayOut, &reverbOut })
+            for (auto& ch : *v)
+                ch.assign ((size_t) kMaxChunk, 0.0f);
         reset();
     }
 
@@ -100,10 +125,45 @@ public:
         engaged = engageTarget = true;
         engageInit = false;
         liveCounter = 0;
+        firingType = -1;
+        delay.reset();
+        reverb.reset();
+        globalCrusher.reset();
+        delayActive = reverbActive = false;
+        delayMixNow = reverbMixNow = crushMixNow = 0.0f;
     }
 
     void process (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host,
                   const PatternBank& bank, const MidiEvent* midi = nullptr, int numMidi = 0, int livePad = -1) noexcept
+    {
+        // Process long host blocks in pieces (the output doesn't depend on how a block is split).
+        const bool hostTempo = (p.syncMode == 0 && host.hasPpq && host.hasBpm);
+        const double bpm = std::clamp (hostTempo ? host.bpm : p.internalBpm, 20.0, 999.0);
+        const double samplesPerQ = sr * 60.0 / bpm;
+
+        int done = 0, im = 0;
+        while (done < numSamples)
+        {
+            const int n = std::min (kMaxChunk, numSamples - done);
+            int nm = 0;
+            while (im < numMidi && midi[im].offset < done + n && nm < (int) chunkMidi.size())
+            {
+                chunkMidi[(size_t) nm] = midi[im++];
+                chunkMidi[(size_t) nm].offset = std::max (0, chunkMidi[(size_t) nm].offset - done);
+                ++nm;
+            }
+
+            HostTime h = host;
+            h.ppq = host.ppq + (double) done / samplesPerQ;
+            float* chunk[2] = { io[0] + done, numCh > 1 ? io[1] + done : nullptr };
+            processChunk (chunk, numCh, n, p, h, bank, chunkMidi.data(), nm, livePad);
+            done += n;
+        }
+    }
+
+private:
+    void processChunk (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host,
+                       const PatternBank& bank, const MidiEvent* midi, int numMidi, int livePad) noexcept
     {
         params = &p;
         bankPtr = &bank;
@@ -175,7 +235,8 @@ public:
             quantSched.reset();
             playingStep = firingStep = -1;
             liveChanged = true; // re-check held notes when playback starts
-            engine.process (io, numCh, 0, numSamples);
+            engine.process (io, numCh, 0, numSamples, sendPtrs());
+            applyFx (io, numCh, numSamples); // tails keep ringing while stopped
             return;
         }
 
@@ -209,6 +270,16 @@ public:
             updateLive (0.0);
         }
 
+        // Knob moves on whatever is glitching right now take effect immediately.
+        if (liveType >= 0)
+            engine.updateControls (controlsOf (bank.live[(size_t) liveType]));
+        else if (firingStep >= 0)
+        {
+            const auto& s = bank.patterns[(size_t) firingPattern][(size_t) firingStep]; // the step that's actually playing
+            if (s.type == firingType)
+                engine.updateControls (controlsOf (s));
+        }
+
         // ---- Walk the block in time order ----------------------------------
         // At the same sample: MIDI first, then bar lines, then steps, then
         // quantise points (so a live note always wins over the pattern).
@@ -228,7 +299,7 @@ public:
             if (which < 0)
                 break;
 
-            engine.process (io, numCh, cursor, next - cursor);
+            engine.process (io, numCh, cursor, next - cursor, sendPtrs());
             cursor = next;
 
             switch (which)
@@ -239,9 +310,11 @@ public:
                 default: onQuant (quantEvents[(size_t) iq++]); break;
             }
         }
-        engine.process (io, numCh, cursor, numSamples - cursor);
+        engine.process (io, numCh, cursor, numSamples - cursor, sendPtrs());
+        applyFx (io, numCh, numSamples);
     }
 
+public:
     // For the UI.
     int getPlayingStep() const noexcept       { return playingStep; }
     int getFiringStep() const noexcept        { return firingStep; }
@@ -335,11 +408,16 @@ private:
         st.level = levelGain (s.levelDb);
         st.pan = s.pan;
         st.filter = s.filter;
+        st.bits = s.bits;
+        st.rate = s.rate;
+        st.send = s.send;
         st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + 0x68e31da4u));
         engine.startStutter (st);
 
         firingStep = idx;
         firingLen = len;
+        firingType = s.type;
+        firingPattern = currentPatternIndex();
     }
 
     void stopPattern() noexcept
@@ -476,8 +554,15 @@ private:
         st.lateBy = lateBy;
         st.minPeriod = spq / 32.0;
         st.fadeSamples = fade;
-        st.p1 = kTypeInfo[(size_t) st.type].p1Default;
-        st.p2 = kTypeInfo[(size_t) st.type].p2Default;
+        const StepData& pad = bankPtr->live[(size_t) st.type]; // the pad's own settings
+        st.p1 = pad.p1;
+        st.p2 = pad.p2;
+        st.level = levelGain (pad.levelDb);
+        st.pan = pad.pan;
+        st.filter = pad.filter;
+        st.bits = pad.bits;
+        st.rate = pad.rate;
+        st.send = pad.send;
         st.seed = hash32 (seedBase ^ (0xA5A5A5A5u + ++liveCounter));
         engine.startStutter (st);
 
@@ -485,8 +570,98 @@ private:
         firingStep = -1;
     }
 
+    static LiveControls controlsOf (const StepData& s) noexcept
+    {
+        return { s.p1, s.p2, levelGain (s.levelDb), s.pan, s.filter, s.bits, s.rate, s.send };
+    }
+
+    float* const* sendPtrs() noexcept
+    {
+        sendPtrArray[0] = sendBuf[0].data();
+        sendPtrArray[1] = sendBuf[1].data();
+        return sendPtrArray;
+    }
+
+    // Linear ramp toward a target over ~20 ms (one step per sample).
+    float rampTo (float now, float target) const noexcept
+    {
+        const float step = (float) (1.0 / (0.02 * sr));
+        return now < target ? std::min (target, now + step) : std::max (target, now - step);
+    }
+
+    // Global crusher, then the delay and reverb returns.
+    void applyFx (float* const* io, int numCh, int numSamples) noexcept
+    {
+        const auto& p = *params;
+        numCh = std::min (numCh, channels);
+
+        // ---- Global crusher (everything) -----------------------------------
+        const bool crushOn = p.crushBits > 0.001f || p.crushRate > 0.001f;
+        const float crushTarget = crushOn ? std::clamp (p.crushMix, 0.0f, 1.0f) : 0.0f;
+        if (crushMixNow > 0.0f || crushTarget > 0.0f)
+        {
+            const double bits = p.crushBits > 0.001f ? crushBits (p.crushBits) : 24.0;
+            const double factor = p.crushRate > 0.001f ? crushRateFactor (p.crushRate) : 1.0;
+            for (int i = 0; i < numSamples; ++i)
+            {
+                crushMixNow = rampTo (crushMixNow, crushTarget);
+                float frame[2] { io[0][i], numCh > 1 ? io[1][i] : 0.0f };
+                float crushed[2] { frame[0], frame[1] };
+                globalCrusher.processFrame (crushed, numCh, factor, bits);
+                for (int c = 0; c < numCh; ++c)
+                    io[c][i] = blend (frame[c], crushed[c], crushMixNow);
+            }
+            if (exactly (crushMixNow, 0.0f)) globalCrusher.reset();
+        }
+
+        // ---- Delay & reverb --------------------------------------------------
+        const float delayTarget = std::clamp (p.delayMix, 0.0f, 1.0f);
+        const float reverbTarget = std::clamp (p.reverbMix, 0.0f, 1.0f);
+        const bool runDelay = delayMixNow > 0.0f || delayTarget > 0.0f;
+        const bool runReverb = reverbMixNow > 0.0f || reverbTarget > 0.0f;
+        if (! runDelay && delayActive)   { delay.reset(); delayActive = false; }
+        if (! runReverb && reverbActive) { reverb.reset(); reverbActive = false; }
+        if (! runDelay && ! runReverb)
+            return;
+
+        const float* src[2] = { p.fxSource == 1 ? io[0] : sendBuf[0].data(),
+                                p.fxSource == 1 ? (numCh > 1 ? io[1] : io[0]) : sendBuf[1].data() };
+        float* dOut[2] = { delayOut[0].data(), delayOut[1].data() };
+        float* rOut[2] = { reverbOut[0].data(), reverbOut[1].data() };
+
+        if (runDelay)
+        {
+            const double dt = kDelayTimePpq[std::clamp (p.delayTime, 0, kNumDelayTimes - 1)] * spq;
+            delay.process (src, dOut, numCh, 0, numSamples, dt, p.delayFeedback, p.delayTone, p.delayPingPong);
+            delayActive = true;
+        }
+        if (runReverb)
+        {
+            reverb.process (src, rOut, numCh, 0, numSamples, p.reverbSize, p.reverbDamp);
+            reverbActive = true;
+        }
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            delayMixNow = runDelay ? rampTo (delayMixNow, delayTarget) : 0.0f;
+            reverbMixNow = runReverb ? rampTo (reverbMixNow, reverbTarget) : 0.0f;
+            for (int c = 0; c < numCh; ++c)
+                io[c][i] += (runDelay ? dOut[c][i] * delayMixNow : 0.0f) + (runReverb ? rOut[c][i] * reverbMixNow : 0.0f);
+        }
+    }
+
     //--------------------------------------------------------------------------
     StutterEngine engine;
+    TempoDelay delay;
+    Reverb reverb;
+    Crusher globalCrusher;
+    std::array<std::vector<float>, 2> sendBuf, delayOut, reverbOut;
+    float* sendPtrArray[2] {};
+    std::array<MidiEvent, 512> chunkMidi {};
+    int channels = 2;
+    bool delayActive = false, reverbActive = false;
+    float delayMixNow = 0.0f, reverbMixNow = 0.0f, crushMixNow = 0.0f;
+    int firingType = -1, firingPattern = 0;
     GridScheduler stepSched, barSched, quantSched;
     std::array<GridEvent, GridScheduler::kMaxEvents> stepEvents {}, barEvents {}, quantEvents {};
     std::array<Held, kMaxHeld> held {};

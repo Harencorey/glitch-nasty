@@ -30,6 +30,7 @@
 // compile it on their own.
 //==============================================================================
 
+#include "Effects.h"
 #include "Pattern.h"
 
 #include <algorithm>
@@ -70,7 +71,17 @@ struct StutterSettings
     float level = 1.0f;      // linear gain
     float pan = 0.0f;        // -1..+1
     float filter = 0.0f;     // -1 (LP) .. +1 (HP)
+    float bits = 0.0f;       // crusher bit reduction (0 = off)
+    float rate = 0.0f;       // crusher rate reduction (0 = off)
+    float send = 1.0f;       // delay/reverb send (0..1)
     uint32_t seed = 0;       // for Variation / Shuffle / Freeze texture
+};
+
+// The controls that can change while a glitch is already playing (knob moves,
+// automation): they glide, they don't wait for the next trigger.
+struct LiveControls
+{
+    float p1 = 0.0f, p2 = 0.0f, level = 1.0f, pan = 0.0f, filter = 0.0f, bits = 0.0f, rate = 0.0f, send = 1.0f;
 };
 
 class StutterEngine
@@ -127,6 +138,16 @@ public:
         hpLog = hpLogT = std::log (20.0f);
         for (auto& f : lpState) f = {};
         for (auto& f : hpState) f = {};
+        shape = shapeTarget = { 1.0f, 1.0f };
+        shapeStep = { 0.0f, 0.0f };
+        shapeRamp = 0;
+        sendAmt = sendTarget = sendStep = 0.0f;
+        sendRamp = 0;
+        crushAmt = crushAmtT = 0.0f;
+        crushBitsNow = 24.0;
+        crushFactorNow = 1.0;
+        crusher.reset();
+        repeatStartElapsed = 0;
         mixCurrent = mixTarget;
         mixStep = 0.0f;
         mixRampLeft = 0;
@@ -180,7 +201,6 @@ public:
         bool loops = true;
 
         Head h = liveHead (S);
-        setGains (h, level, pan);
 
         switch (type)
         {
@@ -271,6 +291,19 @@ public:
         }
 
         setFilterTarget (s.filter);
+        LiveControls lc { p1, p2, level, pan, s.filter, s.bits, s.rate, s.send };
+        setShaping (lc);
+    }
+
+    // Knob moves / automation while the glitch plays.
+    void updateControls (const LiveControls& c) noexcept
+    {
+        if (! stuttering)
+            return;
+        p1 = c.p1;
+        p2 = c.p2;
+        setFilterTarget (c.filter);
+        setShaping (c);
     }
 
     // Return to the live input at the next sample (crossfaded).
@@ -283,14 +316,17 @@ public:
         beginJump (liveHead ((double) writeCount), fadeSamplesForReturn);
         gateUp = gateDown = rampStep ((double) std::max (fadeSamplesForReturn, 0));
         setFilterTarget (0.0f);
+        fadeSamples = std::max (fadeSamplesForReturn, 0);
+        setShaping (LiveControls { p1, p2, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
     }
 
     bool isStuttering() const noexcept { return stuttering; }
     int64_t getCapacity() const noexcept { return capacity; }
     double maxSliceSamples() const noexcept { return (double) (capacity - 2 * kSafetySamples) * 0.25; }
 
-    // Processes io[ch][start .. start+num) in place.
-    void process (float* const* io, int numCh, int start, int num) noexcept
+    // Processes io[ch][start .. start+num) in place. If 'send' is given, the
+    // glitch audio (times each step's Send) is written there for the delay/reverb.
+    void process (float* const* io, int numCh, int start, int num, float* const* send = nullptr) noexcept
     {
         numCh = std::min (numCh, channels);
         constexpr double halfPi = 1.57079632679489661923;
@@ -336,12 +372,30 @@ public:
             // 4) Filter amounts and cutoffs glide (5 ms) so step changes never click.
             const bool filterActive = updateFilterSmoothing();
 
+            const bool crushing = updateCrushSmoothing(); // always advance (never short-circuited)
+            const bool shaping = crushing || shapeRamp > 0 || ! exactly (shape[0], 1.0f) || ! exactly (shape[1], 1.0f)
+                                 || sendRamp > 0 || ! exactly (sendAmt, 0.0f);
+
             // 5) Fast path: nothing going on -> output == input, untouched (bit-identical).
-            if (! stuttering && fadeRemaining == 0 && gateGain >= 1.0f && ! filterActive)
+            if (! stuttering && fadeRemaining == 0 && gateGain >= 1.0f && ! filterActive && ! shaping)
             {
+                if (send != nullptr)
+                    for (int c = 0; c < numCh; ++c) send[c][i] = 0.0f;
                 ++writeCount;
                 head = liveHead ((double) writeCount);
                 continue;
+            }
+
+            if (shapeRamp > 0)
+            {
+                shape[0] += shapeStep[0];
+                shape[1] += shapeStep[1];
+                if (--shapeRamp == 0) shape = shapeTarget;
+            }
+            if (sendRamp > 0)
+            {
+                sendAmt += sendStep;
+                if (--sendRamp == 0) sendAmt = sendTarget;
             }
 
             // 6) Loop point reached? Start the next repeat.
@@ -362,17 +416,32 @@ public:
                 else            { gIn = (float) std::sin (t * halfPi); gOut = (float) std::cos (t * halfPi); }
             }
 
+            float wet[kMaxChannels] {};
+            for (int c = 0; c < numCh; ++c)
+            {
+                float v = readHead (c, head) * chanGain (head, c);
+                if (fading)
+                    v = v * gIn + readHead (c, fadeHead) * chanGain (fadeHead, c) * gOut;
+                v *= gateGain * shape[(size_t) c];
+                if (filterActive)
+                    v = applyFilter (c, v);
+                wet[c] = v;
+            }
+
+            if (crushAmt > 0.0f)
+            {
+                float crushed[kMaxChannels] { wet[0], wet[1] };
+                crusher.processFrame (crushed, numCh, crushFactorNow, crushBitsNow);
+                for (int c = 0; c < numCh; ++c)
+                    wet[c] = blend (wet[c], crushed[c], crushAmt);
+            }
+
             for (int c = 0; c < numCh; ++c)
             {
                 const float dry = io[c][i];
-                float wet = readHead (c, head) * chanGain (head, c);
-                if (fading)
-                    wet = wet * gIn + readHead (c, fadeHead) * chanGain (fadeHead, c) * gOut;
-                wet *= gateGain;
-                if (filterActive)
-                    wet = applyFilter (c, wet);
-
-                io[c][i] = dry + mixCurrent * (wet - dry);
+                io[c][i] = blend (dry, wet[c], mixCurrent);
+                if (send != nullptr)
+                    send[c][i] = wet[c] * sendAmt;
             }
 
             advance (head);
@@ -484,8 +553,8 @@ private:
         const double S = (double) sliceStart;
 
         Head h = liveHead (regionStart);
-        setGains (h, level, pan);
         double per = sliceLen;
+        repeatStartElapsed = elapsed;
 
         switch (type)
         {
@@ -494,15 +563,19 @@ private:
                 break;
 
             case StutterType::reverse:
-            {
-                const bool forward = choiceIndex (p1, 2) == 1 && (k % 2 == 0); // ping-pong
-                if (! forward)
+                if (choiceIndex (p1, 2) == 1)
+                {
+                    // Ping-pong: back from the middle of the slice to its start, then
+                    // forward again - a yo-yo inside every repeat, no jump at the turn.
+                    h.pos = regionStart + std::floor (sliceLen * 0.5);
+                    h.rate = -1.0;
+                }
+                else
                 {
                     h.pos = regionStart + sliceLen - 1.0;
                     h.rate = -1.0;
                 }
                 break;
-            }
 
             case StutterType::roll:
             {
@@ -556,7 +629,7 @@ private:
             case StutterType::pingPong:
             {
                 const float side = (k % 2 == 1) ? -1.0f : 1.0f;
-                setGains (h, level, std::clamp (pan + side * clamp01 (p1), -1.0f, 1.0f));
+                setGains (h, 1.0f, side * clamp01 (p1));
                 h.pos = S;
                 h.amp = (float) std::pow (pingDecay (p2), (double) k);
                 break;
@@ -610,8 +683,13 @@ private:
                 }
                 break;
 
-            case StutterType::repeat:
             case StutterType::reverse:
+                if (repeatIndex > 0 && choiceIndex (p1, 2) == 1 && head.rate < 0.0
+                    && (double) (elapsed - repeatStartElapsed) >= std::floor (sliceLen * 0.5))
+                    head.rate = 1.0; // the turn of the yo-yo
+                break;
+
+            case StutterType::repeat:
             case StutterType::gate:
             case StutterType::roll:
             case StutterType::fade:
@@ -669,6 +747,53 @@ private:
             return a;
         const float n = b[(size_t) ((i0 + 1) & mask)];
         return a + frac * (n - a);
+    }
+
+    //==========================================================================
+    // Level / pan / send glide linearly over the crossfade time; the crusher fades in/out.
+    void setShaping (const LiveControls& c) noexcept
+    {
+        const float lvl = std::max (0.0f, c.level);
+        const float pn = channels < 2 ? 0.0f : std::clamp (c.pan, -1.0f, 1.0f);
+        const std::array<float, 2> target { lvl * (pn > 0.0f ? 1.0f - pn : 1.0f), lvl * (pn < 0.0f ? 1.0f + pn : 1.0f) };
+        const int ramp = std::max (1, fadeSamples);
+
+        if (! exactly (target[0], shapeTarget[0]) || ! exactly (target[1], shapeTarget[1]))
+        {
+            shapeTarget = target;
+            if (fadeSamples <= 0) { shape = target; shapeRamp = 0; }
+            else
+            {
+                shapeStep = { (target[0] - shape[0]) / (float) ramp, (target[1] - shape[1]) / (float) ramp };
+                shapeRamp = ramp;
+            }
+        }
+
+        const float sendT = clamp01 (c.send);
+        if (! exactly (sendT, sendTarget))
+        {
+            sendTarget = sendT;
+            if (fadeSamples <= 0) { sendAmt = sendT; sendRamp = 0; }
+            else { sendStep = (sendT - sendAmt) / (float) ramp; sendRamp = ramp; }
+        }
+
+        const bool crushOn = c.bits > 0.001f || c.rate > 0.001f;
+        crushAmtT = crushOn ? 1.0f : 0.0f;
+        if (crushOn)
+        {
+            crushBitsNow = c.bits > 0.001f ? crushBits (c.bits) : 24.0;
+            crushFactorNow = c.rate > 0.001f ? crushRateFactor (c.rate) : 1.0;
+            if (exactly (crushAmt, 0.0f)) crusher.reset();
+        }
+        crushStep = rampStep ((double) fadeSamples);
+    }
+
+    bool updateCrushSmoothing() noexcept
+    {
+        if (exactly (crushAmt, crushAmtT))
+            return crushAmt > 0.0f;
+        crushAmt = crushAmt < crushAmtT ? std::min (crushAmtT, crushAmt + crushStep) : std::max (crushAmtT, crushAmt - crushStep);
+        return true;
     }
 
     //==========================================================================
@@ -769,6 +894,15 @@ private:
     float lpAmt = 0.0f, hpAmt = 0.0f, lpAmtT = 0.0f, hpAmtT = 0.0f;
     float lpLog = 0.0f, hpLog = 0.0f, lpLogT = 0.0f, hpLogT = 0.0f;
     float filterSmooth = 0.99f;
+
+    std::array<float, 2> shape { 1.0f, 1.0f }, shapeTarget { 1.0f, 1.0f }, shapeStep { 0.0f, 0.0f };
+    int shapeRamp = 0;
+    float sendAmt = 0.0f, sendTarget = 0.0f, sendStep = 0.0f;
+    int sendRamp = 0;
+    float crushAmt = 0.0f, crushAmtT = 0.0f, crushStep = 1.0f;
+    double crushBitsNow = 24.0, crushFactorNow = 1.0;
+    Crusher crusher;
+    int64_t repeatStartElapsed = 0;
     std::array<SvfState, kMaxChannels> lpState {}, hpState {};
 
     float mixTarget = 1.0f, mixCurrent = 1.0f, mixStep = 0.0f;

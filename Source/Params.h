@@ -27,6 +27,18 @@ inline constexpr const char* pattern   = "pattern";
 inline constexpr const char* engage    = "engage";
 inline constexpr const char* liveDiv   = "live_div";
 inline constexpr const char* liveQuant = "live_quant";
+inline constexpr const char* crushBits = "crush_bits";
+inline constexpr const char* crushRate = "crush_rate";
+inline constexpr const char* crushMix  = "crush_mix";
+inline constexpr const char* fxSource  = "fx_source";
+inline constexpr const char* dlyTime   = "dly_time";
+inline constexpr const char* dlyFb     = "dly_fb";
+inline constexpr const char* dlyTone   = "dly_tone";
+inline constexpr const char* dlyPing   = "dly_ping";
+inline constexpr const char* dlyMix    = "dly_mix";
+inline constexpr const char* revSize   = "rev_size";
+inline constexpr const char* revDamp   = "rev_damp";
+inline constexpr const char* revMix    = "rev_mix";
 } // namespace gn::ids
 
 namespace gn
@@ -82,6 +94,35 @@ inline juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout
                                                         namesOf (kDivisionNames, kNumDivisions), kDiv16));
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::liveQuant, v }, "Live Quantize",
                                                         namesOf (kQuantNames, kNumQuants), 1));
+
+    // ---- added in 0.3: crusher, delay, reverb ----
+    auto pct = [] (float x, int) { return String (roundToInt (x)) + " %"; };
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::crushBits, v }, "Crush Bits",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
+                                                       withText ([] (float x, int) { return x < 0.1f ? String ("Off") : String (crushBits (x * 0.01f), 1) + " bit"; })));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::crushRate, v }, "Crush Rate",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f,
+                                                       withText ([] (float x, int) { return x < 0.1f ? String ("Off") : "/" + String (crushRateFactor (x * 0.01f), 1); })));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::crushMix, v }, "Crush Mix",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f, withText (pct)));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::fxSource, v }, "FX Source",
+                                                        StringArray { "Glitches", "Everything" }, 0));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::dlyTime, v }, "Delay Time",
+                                                        namesOf (kDelayTimeNames, kNumDelayTimes), kDefaultDelayTime));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::dlyFb, v }, "Delay Feedback",
+                                                       NormalisableRange<float> (0.0f, 95.0f, 0.1f), 45.0f, withText (pct)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::dlyTone, v }, "Delay Tone",
+                                                       NormalisableRange<float> (-100.0f, 100.0f, 1.0f), -20.0f,
+                                                       withText ([] (float x, int) { const int i = roundToInt (x); return i == 0 ? String ("Flat") : (i < 0 ? "Dark " : "Thin ") + String (std::abs (i)); })));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::dlyPing, v }, "Delay Ping-Pong", true));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::dlyMix, v }, "Delay Mix",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f, withText (pct)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::revSize, v }, "Reverb Size",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 55.0f, withText (pct)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::revDamp, v }, "Reverb Damping",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 40.0f, withText (pct)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::revMix, v }, "Reverb Mix",
+                                                       NormalisableRange<float> (0.0f, 100.0f, 0.1f), 0.0f, withText (pct)));
     return layout;
 }
 

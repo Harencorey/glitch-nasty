@@ -23,9 +23,12 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
     knobs[kCtl1].setup (*this, "CTL 1", {});
     knobs[kCtl2].setup (*this, "CTL 2", {});
     knobs[kLength].setup (*this, "LENGTH", "How many steps this glitch lasts. Above 1, it ties over the following steps (they're skipped).");
-    knobs[kLevel].setup (*this, "LEVEL", "Level of this step's glitch. All the way down = silent (a mute step).");
-    knobs[kPan].setup (*this, "PAN", "Where this step's glitch sits in the stereo field.");
+    knobs[kLevel].setup (*this, "LEVEL", "Level of this glitch. All the way down = silent (a mute step).");
+    knobs[kPan].setup (*this, "PAN", "Where this glitch sits in the stereo field.");
     knobs[kFilter].setup (*this, "FILTER", "Left = low-pass (down to 200 Hz), right = high-pass (up to 4 kHz), centre = off. Only on the glitch, never the dry signal.");
+    knobs[kBits].setup (*this, "BITS", "Bit crush for this glitch: off, then 16 bits down to 1. Set it differently on each step to sequence the crusher.");
+    knobs[kRate].setup (*this, "RATE", "Sample-rate reduction for this glitch: off, then down to 1/64 of the sample rate (aliasing included, on purpose).");
+    knobs[kSend].setup (*this, "SEND", "How much of this glitch goes to the delay and reverb (when the FX source is set to Glitches).");
 
     for (int k : { kCtl1, kCtl2 })
         knobs[(size_t) k].slider.setColour (juce::Slider::rotarySliderFillColourId, nasty);
@@ -33,7 +36,12 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
     auto& len = knobs[kLength].slider;
     len.setRange (1.0, gn::kMaxSteps, 1.0);
     len.setDoubleClickReturnValue (true, 1.0);
-    len.textFromValueFunction = [] (double v) { const int n = juce::roundToInt (v); return juce::String (n) + (n == 1 ? " step" : " steps"); };
+    len.textFromValueFunction = [this] (double v)
+    {
+        if (liveTarget) return juce::String ("while held");
+        const int n = juce::roundToInt (v);
+        return juce::String (n) + (n == 1 ? " step" : " steps");
+    };
 
     auto& lvl = knobs[kLevel].slider;
     lvl.setRange (gn::kLevelMinDb, gn::kLevelMaxDb, 0.1);
@@ -62,6 +70,24 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
         return juce::String ("Off");
     };
 
+    auto& bits = knobs[kBits].slider;
+    bits.setRange (0.0, 1.0, 0.001);
+    bits.setDoubleClickReturnValue (true, 0.0);
+    bits.textFromValueFunction = [] (double v) { return v < 0.001 ? juce::String ("Off") : juce::String (gn::crushBits ((float) v), 1) + " bit"; };
+
+    auto& rate = knobs[kRate].slider;
+    rate.setRange (0.0, 1.0, 0.001);
+    rate.setDoubleClickReturnValue (true, 0.0);
+    rate.textFromValueFunction = [] (double v) { return v < 0.001 ? juce::String ("Off") : "/" + juce::String (gn::crushRateFactor ((float) v), 1); };
+
+    auto& send = knobs[kSend].slider;
+    send.setRange (0.0, 1.0, 0.01);
+    send.setDoubleClickReturnValue (true, 1.0);
+    send.textFromValueFunction = [] (double v) { return percent (v); };
+
+    for (int k : { kBits, kRate, kSend })
+        knobs[(size_t) k].slider.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff53d7ff));
+
     for (int k = 0; k < kNumKnobs; ++k)
         knobs[(size_t) k].slider.onValueChange = [this, k] { if (! updating) knobChanged (k); };
 
@@ -72,7 +98,27 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
 void StepEditor::setStep (int newStep)
 {
     step = juce::jlimit (0, gn::kMaxSteps - 1, newStep);
+    liveTarget = false;
     refresh (true);
+}
+
+void StepEditor::setLivePad (int type)
+{
+    liveType = juce::jlimit (0, gn::kNumStutterTypes - 1, type);
+    liveTarget = true;
+    refresh (true);
+}
+
+gn::StepData StepEditor::readTarget() const
+{
+    return liveTarget ? processor.getLiveStep (liveType) : processor.getStep (processor.getEditPattern(), step);
+}
+
+void StepEditor::editTarget (const std::function<void (gn::StepData&)>& change)
+{
+    if (liveTarget) processor.editLiveStep (liveType, change);
+    else            processor.editStep (processor.getEditPattern(), step, change);
+    current = readTarget();
 }
 
 const gn::TypeControl& StepEditor::typeControl (int which) const
@@ -103,7 +149,6 @@ void StepEditor::configureTypeKnob (int which, int type)
         k.slider.setDoubleClickReturnValue (true, def);
     }
 
-    // Pitch and glide are bipolar (0 st in the middle).
     k.slider.getProperties().set ("bipolar", (gn::StutterType) type == gn::StutterType::pitch);
     k.slider.textFromValueFunction = [this, which] (double v) { return formatTypeControl (which, v); };
 }
@@ -119,6 +164,7 @@ juce::String StepEditor::formatTypeControl (int which, double v) const
     const bool first = which == kCtl1;
     auto offsetText = [this, p]
     {
+        if (liveTarget) return "Slice " + percent (p);
         const double stepPpq = processor.getGridPpq() * (double) current.length;
         const int n = gn::slicesIn (stepPpq, gn::kDivisionPpq[(size_t) juce::jlimit (0, gn::kNumDivisions - 1, current.division)]);
         return "Slice " + juce::String (gn::sliceOffset (p, n) + 1) + "/" + juce::String (n);
@@ -152,7 +198,7 @@ void StepEditor::knobChanged (int which)
             p = (float) v / (float) (tc.numChoices - 1);
     }
 
-    processor.editStep (processor.getEditPattern(), step, [which, v, p] (gn::StepData& s)
+    editTarget ([which, v, p] (gn::StepData& s)
     {
         switch (which)
         {
@@ -162,10 +208,12 @@ void StepEditor::knobChanged (int which)
             case kLevel:  s.levelDb = (float) v; break;
             case kPan:    s.pan = (float) v; break;
             case kFilter: s.filter = (float) v; break;
+            case kBits:   s.bits = (float) v; break;
+            case kRate:   s.rate = (float) v; break;
+            case kSend:   s.send = (float) v; break;
             default: break;
         }
     });
-    current = processor.getStep (processor.getEditPattern(), step);
 
     // Offset readouts depend on length/division: keep them current.
     knobs[kCtl1].slider.updateText();
@@ -183,20 +231,21 @@ void StepEditor::refresh (bool force)
         if (k.slider.isMouseButtonDown())
             return; // don't fight the user's drag
 
-    const int pat = processor.getEditPattern();
-    const auto s = processor.getStep (pat, step);
     using gn::exactly;
-    const bool changed = force || pat != shownPattern || step != shownStep || s.type != shownType
+    const int pat = processor.getEditPattern();
+    const auto s = readTarget();
+    const bool changed = force || pat != shownPattern || step != shownStep || liveTarget != shownLive || s.type != shownType
                          || ! exactly (s.p1, current.p1) || ! exactly (s.p2, current.p2) || s.length != current.length
                          || ! exactly (s.levelDb, current.levelDb) || ! exactly (s.pan, current.pan)
-                         || ! exactly (s.filter, current.filter) || s.division != current.division || s.on != current.on;
+                         || ! exactly (s.filter, current.filter) || s.division != current.division || s.on != current.on
+                         || ! exactly (s.bits, current.bits) || ! exactly (s.rate, current.rate) || ! exactly (s.send, current.send);
     if (! changed)
         return;
 
     current = s;
     const juce::ScopedValueSetter<bool> svs (updating, true);
 
-    if (force || s.type != shownType)
+    if (force || s.type != shownType || liveTarget != shownLive)
     {
         configureTypeKnob (kCtl1, s.type);
         configureTypeKnob (kCtl2, s.type);
@@ -204,13 +253,13 @@ void StepEditor::refresh (bool force)
     }
     shownPattern = pat;
     shownStep = step;
+    shownLive = liveTarget;
 
     auto setTypeKnob = [this] (int which, float p)
     {
         const auto& tc = typeControl (which);
         knobs[(size_t) which].slider.setValue (tc.numChoices > 0 ? (double) gn::choiceIndex (p, tc.numChoices) : (double) p,
                                                juce::dontSendNotification);
-        knobs[(size_t) which].slider.updateText();
     };
     setTypeKnob (kCtl1, s.p1);
     setTypeKnob (kCtl2, s.p2);
@@ -218,11 +267,15 @@ void StepEditor::refresh (bool force)
     knobs[kLevel].slider.setValue (s.levelDb, juce::dontSendNotification);
     knobs[kPan].slider.setValue (s.pan, juce::dontSendNotification);
     knobs[kFilter].slider.setValue (s.filter, juce::dontSendNotification);
+    knobs[kBits].slider.setValue (s.bits, juce::dontSendNotification);
+    knobs[kRate].slider.setValue (s.rate, juce::dontSendNotification);
+    knobs[kSend].slider.setValue (s.send, juce::dontSendNotification);
 
+    knobs[kLength].slider.setEnabled (! liveTarget); // a pad lasts as long as you hold it
     for (auto& k : knobs)
     {
         k.slider.updateText(); // readouts depend on the type, length and grid
-        k.slider.setAlpha (s.on ? 1.0f : 0.55f);
+        k.slider.setAlpha (s.on || liveTarget ? 1.0f : 0.55f);
     }
     repaint();
 }
@@ -233,41 +286,53 @@ void StepEditor::paint (juce::Graphics& g)
     auto r = getLocalBounds().toFloat();
     g.setColour (panel);
     g.fillRoundedRectangle (r, 6.0f);
-    g.setColour (outline);
-    g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+    g.setColour (liveTarget ? nasty.withAlpha (0.6f) : outline);
+    g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, liveTarget ? 1.5f : 1.0f);
 
     auto header = getLocalBounds().reduced (14, 8).removeFromTop (20);
-    const auto patName = gn::kPatternNames[(size_t) processor.getEditPattern()];
     g.setFont (juce::FontOptions (15.0f, juce::Font::bold));
-    g.setColour (current.on ? acid : dimText);
-    const juce::String title = juce::String ("STEP ") + juce::String (step + 1) + "  " + juce::String (gn::kTypeNames[(size_t) current.type]).toUpperCase();
-    g.drawText (title, header, juce::Justification::centredLeft);
-    g.setColour (dimText);
-    g.setFont (juce::FontOptions (12.0f));
-    g.drawText (juce::String ("PATTERN ") + patName + (current.on ? "" : "   (step is off)"), header, juce::Justification::centredRight);
+    const auto typeName = juce::String (gn::kTypeNames[(size_t) current.type]).toUpperCase();
+    if (liveTarget)
+    {
+        g.setColour (nasty);
+        g.drawText ("LIVE PAD  " + typeName, header, juce::Justification::centredLeft);
+        g.setColour (dimText);
+        g.setFont (juce::FontOptions (12.0f));
+        g.drawText ("click a step number to edit the pattern", header, juce::Justification::centredRight);
+    }
+    else
+    {
+        g.setColour (current.on ? acid : dimText);
+        g.drawText ("STEP " + juce::String (step + 1) + "  " + typeName, header, juce::Justification::centredLeft);
 
-    // Type description
+        // How many repeats this step has room for: several controls only show with 2+.
+        const double stepPpq = processor.getGridPpq() * (double) current.length;
+        const int slices = gn::slicesIn (stepPpq, gn::kDivisionPpq[(size_t) juce::jlimit (0, gn::kNumDivisions - 1, current.division)]);
+        g.setColour (dimText);
+        g.setFont (juce::FontOptions (12.0f));
+        juce::String info = juce::String ("PATTERN ") + gn::kPatternNames[(size_t) processor.getEditPattern()]
+                            + "   " + juce::String (slices - 1) + (slices == 2 ? " repeat" : " repeats") + " in this step";
+        if (! current.on) info << "   (step is off)";
+        g.drawText (info, header, juce::Justification::centredRight);
+    }
+
     auto help = getLocalBounds().reduced (14, 0).withTrimmedTop (32).removeFromTop (30);
     g.setColour (text.withAlpha (0.7f));
     g.setFont (juce::FontOptions (11.5f));
     g.drawFittedText (gn::kTypeInfo[(size_t) current.type].help, help, juce::Justification::topLeft, 2, 0.95f);
 
-    // Divider between the type controls and the shaping controls
-    const auto div = knobs[kLength].label.getBounds().getX() - 6;
+    // Dividers: type controls | shaping | crush & send
     g.setColour (outline);
-    g.drawVerticalLine (div, (float) help.getBottom() + 6.0f, (float) getHeight() - 10.0f);
+    for (int k : { kLength, kBits })
+        g.drawVerticalLine (knobs[(size_t) k].label.getBounds().getX() - 3, (float) help.getBottom() + 6.0f, (float) getHeight() - 10.0f);
 }
 
 void StepEditor::resized()
 {
-    auto r = getLocalBounds().reduced (10, 0);
+    auto r = getLocalBounds().reduced (8, 0);
     r.removeFromTop (68);
     r.removeFromBottom (8);
     const int w = r.getWidth() / kNumKnobs;
     for (int k = 0; k < kNumKnobs; ++k)
-    {
-        auto col = r.removeFromLeft (w);
-        if (k == kLength) col.removeFromLeft (6);
-        knobs[(size_t) k].setBounds (col);
-    }
+        knobs[(size_t) k].setBounds (r.removeFromLeft (w));
 }

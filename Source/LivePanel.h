@@ -14,6 +14,9 @@ class LivePad : public juce::Component,
 public:
     LivePad (GlitchNastyProcessor& p, int t);
 
+    std::function<void (int)> onPressed; // tells the panel this pad was clicked
+    bool selected = false;
+
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
@@ -29,6 +32,9 @@ class LivePanel : public juce::Component,
 {
 public:
     explicit LivePanel (GlitchNastyProcessor&);
+
+    std::function<void (int)> onPadSelected; // a pad was clicked: edit its settings
+    void setSelectedPad (int type);          // -1 = none
 
     void paint (juce::Graphics&) override;
     void resized() override;

@@ -113,6 +113,9 @@ constexpr TypeInfo kTypeInfo[kNumStutterTypes] = {
 // both use these, so what you see is what you hear.
 inline float clamp01 (float v) noexcept { return std::clamp (v, 0.0f, 1.0f); }
 
+// a -> b by t, exactly b at t = 1 (a + t * (b - a) isn't, in floating point).
+inline float blend (float a, float b, float t) noexcept { return t >= 1.0f ? b : a + t * (b - a); }
+
 // Exact comparison on purpose (state flags like "fully off"), without -Wfloat-equal noise.
 template <typename F> inline bool exactly (F a, F b) noexcept { return ! (a < b) && ! (a > b); }
 
@@ -136,6 +139,10 @@ inline double pingDecay (float p) noexcept    { return 1.0 - 0.6 * (double) clam
 // Filter knob: -1..0 = low-pass 20 kHz -> 200 Hz, 0..+1 = high-pass 20 Hz -> 4 kHz.
 inline double filterLpHz (float f) noexcept { return 20000.0 * std::pow (0.01, (double) std::clamp (-f, 0.0f, 1.0f)); }
 inline double filterHpHz (float f) noexcept { return 20.0 * std::pow (200.0, (double) std::clamp (f, 0.0f, 1.0f)); }
+
+// Crusher amounts (0 = off): bits 16 -> 1 (log), sample rate divided by 1 -> 64.
+inline double crushBits (float amt) noexcept       { return 16.0 * std::pow (1.0 / 16.0, (double) clamp01 (amt)); }
+inline double crushRateFactor (float amt) noexcept { return std::pow (64.0, (double) clamp01 (amt)); }
 
 constexpr float kLevelMinDb = -30.0f, kLevelMaxDb = 6.0f;
 inline float levelGain (float db) noexcept
@@ -166,6 +173,9 @@ struct StepData
     float filter = 0.0f;   // -1 (LP) .. 0 (off) .. +1 (HP)
     float p1 = 0.0f;       // type control 1 (0..1)
     float p2 = 0.0f;       // type control 2 (0..1)
+    float bits = 0.0f;     // crusher bit reduction (0 = off .. 1 = 1 bit)
+    float rate = 0.0f;     // crusher sample-rate reduction (0 = off .. 1 = /64)
+    float send = 1.0f;     // how much of this glitch goes to the delay/reverb (0..1)
 };
 
 using Pattern = std::array<StepData, kMaxSteps>;
@@ -173,6 +183,7 @@ using Pattern = std::array<StepData, kMaxSteps>;
 struct PatternBank
 {
     std::array<Pattern, kNumPatterns> patterns {};
+    std::array<StepData, kNumStutterTypes> live {}; // the live pads' own settings, one per type
 };
 
 // Changing the type resets its two controls to that type's defaults.
@@ -255,6 +266,9 @@ inline PatternBank makeDefaultBank()
     }
     G[6].filter = 0.5f;
     G[14].filter = -0.6f;
+
+    for (int t = 0; t < kNumStutterTypes; ++t)
+        b.live[(size_t) t] = makeStep ((T) t, kDiv16);
 
     return b; // H stays empty
 }

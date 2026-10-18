@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <functional>
 #include <new>
 #include <random>
@@ -358,11 +359,11 @@ static void testTypeControls()
             const double e = (double) (n - 24000);
             const int k = (int) (e / 6000.0);
             const double u = e - k * 6000.0;
-            const double expect = k == 0 ? (double) n : (k % 2 == 1 ? 24000.0 + 5999.0 - u : 24000.0 + u);
+            const double expect = k == 0 ? (double) n : (u < 3000.0 ? 24000.0 + 3000.0 - u : 24000.0 + (u - 3000.0));
             ok &= std::abs ((double) out[n] - expect) < 0.01;
         }
         CHECK (ok, "Reverse ping-pong");
-        std::printf ("  Reverse Ping-Pong alternates backwards and forwards\n");
+        std::printf ("  Reverse Ping-Pong goes back then forward inside every repeat (no jump at the turn)\n");
     }
 
     // Gate 25 % duty.
@@ -874,6 +875,180 @@ static void testSafety()
     }
 }
 
+//------------------------------------------------------------------------------
+// 9) Live pads use their own settings; knob moves apply to a glitch already playing.
+static void testLiveControls()
+{
+    std::printf ("Live pad settings / controls while playing\n");
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+    p.liveQuant = 0;
+    p.liveDivision = gn::kDiv32;
+
+    // Pad Pitch set to -12 st: the live glitch follows the pad, not the factory default (+12).
+    {
+        gn::PatternBank bank;
+        bank.live[(size_t) T::pitch] = gn::makeStep (T::pitch, gn::kDiv32);
+        bank.live[(size_t) T::pitch].p1 = 0.25f; // -12 st
+        RunConfig cfg;
+        cfg.midi = { { 12000, 0x90, (uint8_t) (60 + (int) T::pitch), 100 }, { 30000, 0x80, (uint8_t) (60 + (int) T::pitch), 0 } };
+        const auto out = run (counterSignal (40000), p, bank, cfg);
+        double worst = 0.0;
+        for (size_t n = 15000; n < 18000; ++n) // first repeat: half speed from 12000
+            worst = std::max (worst, std::abs ((double) out[n] - (12000.0 + 0.5 * (double) (n - 15000))));
+        CHECK (worst < 0.01, "live pad ignored its own Pitch setting (off by %.3f)", worst);
+        std::printf ("  Live pad plays with its own settings (Pitch -12 st on the pad)\n");
+    }
+
+    // Level changed halfway through a long tied glitch: it applies straight away (with a glide).
+    {
+        gn::PatternBank bank;
+        bank.patterns[0][0] = gn::makeStep (T::repeat, gn::kDiv16, 1.0f, 16); // one bar-long glitch
+        gn::GlitchCore core;
+        core.prepare (48000.0, 1);
+        p.crossfadeMs = 3.0f;
+        std::vector<float> buf (96000, 1.0f);
+        gn::HostTime ht; ht.hasPpq = ht.hasBpm = ht.playing = true; ht.bpm = 120.0;
+        for (size_t pos = 0; pos < buf.size(); pos += 500)
+        {
+            if (pos == 48000) bank.patterns[0][0].levelDb = -12.0f; // the "knob move"
+            ht.ppq = (double) pos / 24000.0;
+            float* ptr = buf.data() + pos;
+            core.process (&ptr, 1, 500, p, ht, bank);
+        }
+        const double before = buf[47000], after = buf[49000];
+        CHECK (std::abs (before - 1.0) < 1e-4 && std::abs (after - std::pow (10.0, -12.0 / 20.0)) < 1e-3,
+               "level change mid-glitch: %.3f -> %.3f", before, after);
+        std::printf ("  Level moved mid-glitch: %.2f -> %.2f within 3 ms, no retrigger needed\n", before, after);
+        p.crossfadeMs = 0.0f;
+    }
+}
+
+//------------------------------------------------------------------------------
+// 10) Crusher, delay, reverb.
+static void testFx()
+{
+    std::printf ("Crusher / delay / reverb\n");
+
+    // Per-step crush: 4 bits -> at most 17 distinct levels; rate /8 -> values held 8 samples.
+    {
+        gn::CoreParams p;
+        p.crossfadeMs = 0.0f;
+        auto bank = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : bank.patterns[0]) { s.bits = 0.5f; s.rate = 0.5f; } // 4 bits, /8
+        const auto out = run (sineSignal (48000, 220.0), p, bank);
+        std::vector<float> vals;
+        bool held = true;
+        for (size_t n = 24000; n < 30000; ++n)
+        {
+            vals.push_back (out[n]);
+        }
+        std::sort (vals.begin(), vals.end());
+        const auto distinct = std::unique (vals.begin(), vals.end()) - vals.begin();
+        int changes = 0;
+        for (size_t n = 24001; n < 30000; ++n) changes += out[n] != out[n - 1] ? 1 : 0;
+        held = changes <= 6000 / 8 + 2;
+        CHECK (distinct <= 17 && held, "crush: %d levels, %d changes in 6000 samples", (int) distinct, changes);
+        std::printf ("  Step crush 4 bit / rate /8: %d distinct levels, value changes every >= 8 samples\n", (int) distinct);
+    }
+
+    // Delay: an impulse comes back exactly one 1/8D later, then again at the feedback level; ping-pong alternates.
+    {
+        gn::CoreParams p;
+        p.fxSource = 1;       // everything
+        p.delayMix = 1.0f;
+        p.delayFeedback = 0.5f;
+        p.delayTone = 0.0f;
+        p.delayPingPong = false;
+        gn::PatternBank empty;
+        std::vector<float> imp (60000, 0.0f);
+        imp[1000] = 1.0f;
+        RunConfig cfg; cfg.fixedBlock = 480; // mix ramps settle before the impulse
+        auto both = runAll (imp, p, empty, cfg);
+        const size_t d = 18000; // 1/8D at 120 BPM
+        const bool ok = std::abs (both[0][1000 + d] - 1.0f) < 1e-3 && std::abs (both[0][1000 + 2 * d] - 0.5f / 1.125f) < 2e-2
+                        && std::abs (both[0][1000 + d - 1]) < 1e-6;
+        CHECK (ok, "delay echoes %.3f / %.3f", both[0][1000 + d], both[0][1000 + 2 * d]);
+
+        p.delayPingPong = true;
+        both = runAll (imp, p, empty, cfg);
+        const bool pp = both[0][1000 + d] > 0.4f && std::abs (both[1][1000 + d]) < 1e-6
+                        && both[1][1000 + 2 * d] > 0.1f && std::abs (both[0][1000 + 2 * d]) < 1e-6;
+        CHECK (pp, "ping-pong L/R %.3f/%.3f then %.3f/%.3f", both[0][1000 + d], both[1][1000 + d], both[0][1000 + 2 * d], both[1][1000 + 2 * d]);
+        std::printf ("  Delay: echo lands exactly on the 1/8D, repeats at the feedback level, ping-pong alternates L/R\n");
+    }
+
+    // Glitch-only source: no glitch, no echoes. A glitch: echoes of the glitch.
+    {
+        gn::CoreParams p;
+        p.delayMix = 1.0f;
+        const auto in = sineSignal (96000, 300.0);
+        gn::PatternBank empty;
+        CHECK (run (in, p, empty) == in, "glitch-only delay echoed the dry signal");
+        const auto out = run (in, p, allSteps (T::repeat, gn::kDiv32));
+        CHECK (out != in, "glitch-only delay didn't echo the glitch");
+        std::printf ("  Glitch-only send: the dry signal never reaches the delay, glitches do\n");
+    }
+
+    // Reverb: rings, decays, stays finite and stereo.
+    {
+        gn::CoreParams p;
+        p.fxSource = 1;
+        p.reverbMix = 1.0f;
+        p.reverbSize = 0.5f;
+        gn::PatternBank empty;
+        std::vector<float> imp (48000 * 4, 0.0f);
+        imp[2000] = 1.0f;
+        const auto both = runAll (imp, p, empty, RunConfig {});
+        bool finite = true;
+        for (const auto& ch : both) for (float v : ch) finite &= std::isfinite (v);
+        const double early = rms (both[0], 4000, 28000), late = rms (both[0], 150000, 190000);
+        const double right = rms (both[1], 4000, 28000);
+        const double decayDb = 20.0 * std::log10 (late / early);
+        const double rt60 = 0.35 + 9.0 * std::pow (0.5, 1.6);
+        const double expectDb = -60.0 * (3.5 - 0.33) / rt60; // between the two windows
+        CHECK (finite && right > 1e-4 && late < early && std::abs (decayDb - expectDb) < 12.0,
+               "reverb decay %.1f dB (expected about %.1f)", decayDb, expectDb);
+        std::printf ("  Reverb: stereo, stable, decays %.0f dB over 3.2 s (design: %.0f dB)\n", decayDb, expectDb);
+    }
+
+    // Global crusher on everything; FX at 0 is a true bypass even with everything else on.
+    {
+        gn::CoreParams p;
+        p.crushBits = 0.75f; // 2 bits
+        p.crushMix = 1.0f;
+        gn::PatternBank empty;
+        const auto in = sineSignal (48000, 200.0);
+        const auto out = run (in, p, empty, RunConfig { 48000.0, 120.0, true, true, 2, 480, {} });
+        std::vector<float> vals (out.begin() + 4800, out.end());
+        std::sort (vals.begin(), vals.end());
+        const auto distinct = std::unique (vals.begin(), vals.end()) - vals.begin();
+        CHECK (distinct <= 5, "global crusher: %d levels", (int) distinct);
+
+        gn::CoreParams off;
+        off.delayFeedback = 0.9f; off.reverbSize = 1.0f; off.fxSource = 1; off.crushBits = 1.0f; // all mixes at 0
+        CHECK (run (in, off, empty) == in, "FX with mix 0 changed the audio");
+        std::printf ("  Global crusher (2 bit): %d levels; every FX at mix 0 = bit-identical\n", (int) distinct);
+    }
+
+    // Everything on at once: no allocations, block-size independent.
+    {
+        gn::CoreParams p;
+        p.delayMix = 0.6f; p.reverbMix = 0.5f; p.crushBits = 0.3f; p.crushRate = 0.2f; p.crushMix = 0.5f;
+        auto bank = allSteps (T::shuffle, gn::kDiv32);
+        for (int i = 0; i < 16; ++i) { auto& s = bank.patterns[0][(size_t) i]; s.bits = (float) (i % 4) * 0.2f; s.rate = (float) (i % 3) * 0.25f; s.send = (float) (i % 2); }
+        const auto in = sineSignal (48000 * 3, 410.0);
+        RunConfig a; RunConfig b = a; b.fixedBlock = 1; RunConfig c = a; c.fixedBlock = 4096;
+        gAllocCount = 0;
+        const auto oa = run (in, p, bank, a), ob = run (in, p, bank, b), oc = run (in, p, bank, c);
+        CHECK (gAllocCount == 0, "%d allocations with FX on", gAllocCount.load());
+        double maxDiff = 0.0;
+        for (size_t n = 0; n < in.size(); ++n) maxDiff = std::max ({ maxDiff, (double) std::abs (oa[n] - ob[n]), (double) std::abs (oa[n] - oc[n]) });
+        CHECK (maxDiff == 0.0, "FX outputs differ by %g between block sizes", maxDiff);
+        std::printf ("  All FX on: no allocations, identical output for any block size\n");
+    }
+}
+
 int main()
 {
     testGridAccuracy (48000.0, 120.0, 2, gn::kDiv32, 0.5,  "48k, 120 BPM, grid 1/16, repeat 1/32");
@@ -890,6 +1065,8 @@ int main()
     testRandomness();
     testLive();
     testSafety();
+    testLiveControls();
+    testFx();
 
     std::printf (gFailures == 0 ? "\nALL TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;

@@ -27,7 +27,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    double getTailLengthSeconds() const override { return 10.0; } // delay / reverb tails
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -50,6 +50,8 @@ public:
     double getGridPpq() const;
 
     void editStep (int pattern, int step, const std::function<void (gn::StepData&)>& change);
+    gn::StepData getLiveStep (int type) const;
+    void editLiveStep (int type, const std::function<void (gn::StepData&)>& change);
     void copyPattern (int pattern);
     void pastePattern (int pattern);
     bool hasClipboard() const noexcept { return clipboardValid; }
@@ -102,6 +104,18 @@ private:
     std::atomic<float>* pEngage = nullptr;
     std::atomic<float>* pLiveDiv = nullptr;
     std::atomic<float>* pLiveQuant = nullptr;
+    std::atomic<float>* pCrushBits = nullptr;
+    std::atomic<float>* pCrushRate = nullptr;
+    std::atomic<float>* pCrushMix = nullptr;
+    std::atomic<float>* pFxSource = nullptr;
+    std::atomic<float>* pDlyTime = nullptr;
+    std::atomic<float>* pDlyFb = nullptr;
+    std::atomic<float>* pDlyTone = nullptr;
+    std::atomic<float>* pDlyPing = nullptr;
+    std::atomic<float>* pDlyMix = nullptr;
+    std::atomic<float>* pRevSize = nullptr;
+    std::atomic<float>* pRevDamp = nullptr;
+    std::atomic<float>* pRevMix = nullptr;
 
     void readParameters();
     void publishBank (bool notifyHost); // call with bankLock held

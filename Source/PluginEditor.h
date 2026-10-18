@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FxPanel.h"
 #include "LivePanel.h"
 #include "PatternBar.h"
 #include "PluginProcessor.h"
@@ -53,6 +54,7 @@ private:
     StepGrid grid;
     StepEditor stepEditor;
     LivePanel livePanel;
+    FxPanel fxPanel;
 
     std::vector<double> tapTimes;
     int blink = 0;

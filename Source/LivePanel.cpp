@@ -3,7 +3,8 @@
 LivePad::LivePad (GlitchNastyProcessor& p, int t) : processor (p), type (t)
 {
     setTooltip ("Hold to " + juce::String (gn::kTypeNames[t]).toLowerCase() + " right now (overrides the pattern). "
-                "MIDI " + juce::MidiMessage::getMidiNoteName (gn::kLiveNoteBase + t, true, true, 3) + " does the same.");
+                "Clicking also opens this pad's own settings in the editor on the left. "
+                "MIDI " + juce::MidiMessage::getMidiNoteName (gn::kLiveNoteBase + t, true, true, 3) + " plays it too.");
 }
 
 void LivePad::paint (juce::Graphics& g)
@@ -13,8 +14,8 @@ void LivePad::paint (juce::Graphics& g)
     auto r = getLocalBounds().toFloat().reduced (2.0f);
     g.setColour (active ? nasty : raised);
     g.fillRoundedRectangle (r, 5.0f);
-    g.setColour (active ? nasty.brighter (0.3f) : outline);
-    g.drawRoundedRectangle (r, 5.0f, 1.0f);
+    g.setColour (selected ? acid : (active ? nasty.brighter (0.3f) : outline));
+    g.drawRoundedRectangle (r, 5.0f, selected ? 2.0f : 1.0f);
 
     g.setColour (active ? background : text);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
@@ -29,6 +30,8 @@ void LivePad::mouseDown (const juce::MouseEvent&)
 {
     pressed = true;
     processor.livePad.store (type);
+    if (onPressed)
+        onPressed (type);
     repaint();
 }
 
@@ -47,6 +50,12 @@ LivePanel::LivePanel (GlitchNastyProcessor& p) : processor (p)
     for (int t = 0; t < gn::kNumStutterTypes; ++t)
     {
         pads.push_back (std::make_unique<LivePad> (processor, t));
+        pads.back()->onPressed = [this] (int type)
+        {
+            setSelectedPad (type);
+            if (onPadSelected)
+                onPadSelected (type);
+        };
         addAndMakeVisible (*pads.back());
     }
 
@@ -70,6 +79,15 @@ LivePanel::LivePanel (GlitchNastyProcessor& p) : processor (p)
                 "When a held pad/note actually starts: right away (Off), or on the next 1/16, 1/8, 1/4 or bar line.", quantAttachment);
 
     startTimerHz (30);
+}
+
+void LivePanel::setSelectedPad (int type)
+{
+    for (int t = 0; t < (int) pads.size(); ++t)
+    {
+        pads[(size_t) t]->selected = (t == type);
+        pads[(size_t) t]->repaint();
+    }
 }
 
 void LivePanel::timerCallback()
@@ -98,7 +116,7 @@ void LivePanel::paint (juce::Graphics& g)
     g.drawText ("LIVE", header, juce::Justification::centredLeft);
     g.setColour (dimText);
     g.setFont (juce::FontOptions (11.5f));
-    g.drawText ("hold a pad or MIDI note to glitch now", header.withTrimmedLeft (48), juce::Justification::centredLeft);
+    g.drawText ("hold to glitch - click to edit its settings", header.withTrimmedLeft (48), juce::Justification::centredLeft);
 }
 
 void LivePanel::resized()
@@ -107,10 +125,11 @@ void LivePanel::resized()
     r.removeFromTop (26);
 
     auto bottom = r.removeFromBottom (28);
-    repeatLabel.setBounds (bottom.removeFromLeft (64));
-    repeatBox.setBounds (bottom.removeFromLeft (90).reduced (4, 1));
-    quantLabel.setBounds (bottom.removeFromLeft (80));
-    quantBox.setBounds (bottom.removeFromLeft (90).reduced (4, 1));
+    const int w4 = bottom.getWidth() / 4;
+    repeatLabel.setBounds (bottom.removeFromLeft (w4 - 6));
+    repeatBox.setBounds (bottom.removeFromLeft (w4 + 6).reduced (4, 1));
+    quantLabel.setBounds (bottom.removeFromLeft (w4 + 6));
+    quantBox.setBounds (bottom.reduced (4, 1));
     r.removeFromBottom (6);
 
     constexpr int cols = 4;

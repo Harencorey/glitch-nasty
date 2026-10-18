@@ -4,7 +4,7 @@ using namespace gn::colours;
 
 GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
     : AudioProcessorEditor (&p), processor (p),
-      patternBar (p), grid (p), stepEditor (p), livePanel (p)
+      patternBar (p), grid (p), stepEditor (p), livePanel (p), fxPanel (p)
 {
     setLookAndFeel (&lookAndFeel);
 
@@ -51,12 +51,23 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
     addAndMakeVisible (grid);
     addAndMakeVisible (stepEditor);
     addAndMakeVisible (livePanel);
+    addAndMakeVisible (fxPanel);
 
-    grid.onStepSelected = [this] (int s) { stepEditor.setStep (s); };
+    // The editor follows whatever you clicked last: a step number or a live pad.
+    grid.onStepSelected = [this] (int s)
+    {
+        stepEditor.setStep (s);
+        livePanel.setSelectedPad (-1);
+    };
+    livePanel.onPadSelected = [this] (int type)
+    {
+        stepEditor.setLivePad (type);
+        grid.setSelectedStep (-1);
+    };
     grid.setSelectedStep (3);
     stepEditor.setStep (3);
 
-    setSize (1100, 740);
+    setSize (1100, 884);
     startTimerHz (10);
 }
 
@@ -203,7 +214,10 @@ void GlitchNastyEditor::resized()
     area.removeFromTop (12);
 
     auto bottom = area.removeFromTop (226);
-    livePanel.setBounds (bottom.removeFromRight (430));
+    livePanel.setBounds (bottom.removeFromRight (360));
     bottom.removeFromRight (12);
     stepEditor.setBounds (bottom);
+
+    area.removeFromTop (12);
+    fxPanel.setBounds (area.removeFromTop (134));
 }

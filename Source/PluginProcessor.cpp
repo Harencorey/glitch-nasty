@@ -5,7 +5,45 @@ namespace
 {
 const juce::Identifier idPatterns ("PATTERNS"), idP ("P"), idS ("S"), idI ("i");
 const juce::Identifier idOn ("on"), idChance ("chance"), idDiv ("div"), idType ("type"), idLen ("len"),
-                       idLevel ("level"), idPan ("pan"), idFilter ("filter"), idP1 ("p1"), idP2 ("p2");
+                       idLevel ("level"), idPan ("pan"), idFilter ("filter"), idP1 ("p1"), idP2 ("p2"),
+                       idBits ("bits"), idRate ("rate"), idSend ("send"), idLive ("LIVE");
+
+juce::ValueTree stepToTree (const gn::StepData& s, int index)
+{
+    juce::ValueTree st (idS);
+    st.setProperty (idI, index, nullptr);
+    st.setProperty (idOn, s.on, nullptr);
+    st.setProperty (idChance, s.chance, nullptr);
+    st.setProperty (idDiv, s.division, nullptr);
+    st.setProperty (idType, s.type, nullptr);
+    st.setProperty (idLen, s.length, nullptr);
+    st.setProperty (idLevel, s.levelDb, nullptr);
+    st.setProperty (idPan, s.pan, nullptr);
+    st.setProperty (idFilter, s.filter, nullptr);
+    st.setProperty (idP1, s.p1, nullptr);
+    st.setProperty (idP2, s.p2, nullptr);
+    st.setProperty (idBits, s.bits, nullptr);
+    st.setProperty (idRate, s.rate, nullptr);
+    st.setProperty (idSend, s.send, nullptr);
+    return st;
+}
+
+void stepFromTree (const juce::ValueTree& st, gn::StepData& s)
+{
+    s.on       = st.getProperty (idOn, false);
+    s.chance   = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idChance, 1.0f));
+    s.division = juce::jlimit (0, gn::kNumDivisions - 1, (int) st.getProperty (idDiv, gn::kDiv32));
+    s.type     = juce::jlimit (0, gn::kNumStutterTypes - 1, (int) st.getProperty (idType, 0));
+    s.length   = juce::jlimit (1, gn::kMaxSteps, (int) st.getProperty (idLen, 1));
+    s.levelDb  = juce::jlimit (gn::kLevelMinDb, gn::kLevelMaxDb, (float) st.getProperty (idLevel, 0.0f));
+    s.pan      = juce::jlimit (-1.0f, 1.0f, (float) st.getProperty (idPan, 0.0f));
+    s.filter   = juce::jlimit (-1.0f, 1.0f, (float) st.getProperty (idFilter, 0.0f));
+    s.p1       = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idP1, gn::kTypeInfo[(size_t) s.type].p1Default));
+    s.p2       = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idP2, gn::kTypeInfo[(size_t) s.type].p2Default));
+    s.bits     = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idBits, 0.0f));
+    s.rate     = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idRate, 0.0f));
+    s.send     = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idSend, 1.0f));
+}
 } // namespace
 
 GlitchNastyProcessor::GlitchNastyProcessor()
@@ -29,6 +67,18 @@ GlitchNastyProcessor::GlitchNastyProcessor()
     pEngage    = apvts.getRawParameterValue (ids::engage);
     pLiveDiv   = apvts.getRawParameterValue (ids::liveDiv);
     pLiveQuant = apvts.getRawParameterValue (ids::liveQuant);
+    pCrushBits = apvts.getRawParameterValue (ids::crushBits);
+    pCrushRate = apvts.getRawParameterValue (ids::crushRate);
+    pCrushMix  = apvts.getRawParameterValue (ids::crushMix);
+    pFxSource  = apvts.getRawParameterValue (ids::fxSource);
+    pDlyTime   = apvts.getRawParameterValue (ids::dlyTime);
+    pDlyFb     = apvts.getRawParameterValue (ids::dlyFb);
+    pDlyTone   = apvts.getRawParameterValue (ids::dlyTone);
+    pDlyPing   = apvts.getRawParameterValue (ids::dlyPing);
+    pDlyMix    = apvts.getRawParameterValue (ids::dlyMix);
+    pRevSize   = apvts.getRawParameterValue (ids::revSize);
+    pRevDamp   = apvts.getRawParameterValue (ids::revDamp);
+    pRevMix    = apvts.getRawParameterValue (ids::revMix);
 
     bank = gn::makeDefaultBank();
     bankBuffer.reset (bank);
@@ -68,6 +118,18 @@ void GlitchNastyProcessor::readParameters()
     params.engage       = pEngage->load() > 0.5f;
     params.liveDivision = (int) pLiveDiv->load();
     params.liveQuant    = (int) pLiveQuant->load();
+    params.crushBits     = pCrushBits->load() * 0.01f;
+    params.crushRate     = pCrushRate->load() * 0.01f;
+    params.crushMix      = pCrushMix->load() * 0.01f;
+    params.fxSource      = (int) pFxSource->load();
+    params.delayTime     = (int) pDlyTime->load();
+    params.delayFeedback = pDlyFb->load() * 0.01f;
+    params.delayTone     = pDlyTone->load() * 0.01f;
+    params.delayPingPong = pDlyPing->load() > 0.5f;
+    params.delayMix      = pDlyMix->load() * 0.01f;
+    params.reverbSize    = pRevSize->load() * 0.01f;
+    params.reverbDamp    = pRevDamp->load() * 0.01f;
+    params.reverbMix     = pRevMix->load() * 0.01f;
 }
 
 void GlitchNastyProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
@@ -184,6 +246,22 @@ void GlitchNastyProcessor::editStep (int pattern, int step, const std::function<
 {
     const juce::ScopedLock sl (bankLock);
     change (bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)][(size_t) juce::jlimit (0, gn::kMaxSteps - 1, step)]);
+    publishBank (true);
+}
+
+gn::StepData GlitchNastyProcessor::getLiveStep (int type) const
+{
+    const juce::ScopedLock sl (bankLock);
+    return bank.live[(size_t) juce::jlimit (0, gn::kNumStutterTypes - 1, type)];
+}
+
+void GlitchNastyProcessor::editLiveStep (int type, const std::function<void (gn::StepData&)>& change)
+{
+    const juce::ScopedLock sl (bankLock);
+    auto& s = bank.live[(size_t) juce::jlimit (0, gn::kNumStutterTypes - 1, type)];
+    change (s);
+    s.type = juce::jlimit (0, gn::kNumStutterTypes - 1, type); // a pad's type never changes
+    s.on = true;
     publishBank (true);
 }
 
@@ -309,24 +387,14 @@ juce::ValueTree GlitchNastyProcessor::patternsToTree (const gn::PatternBank& b) 
         juce::ValueTree pt (idP);
         pt.setProperty (idI, p, nullptr);
         for (int i = 0; i < gn::kMaxSteps; ++i)
-        {
-            const auto& s = b.patterns[(size_t) p][(size_t) i];
-            juce::ValueTree st (idS);
-            st.setProperty (idI, i, nullptr);
-            st.setProperty (idOn, s.on, nullptr);
-            st.setProperty (idChance, s.chance, nullptr);
-            st.setProperty (idDiv, s.division, nullptr);
-            st.setProperty (idType, s.type, nullptr);
-            st.setProperty (idLen, s.length, nullptr);
-            st.setProperty (idLevel, s.levelDb, nullptr);
-            st.setProperty (idPan, s.pan, nullptr);
-            st.setProperty (idFilter, s.filter, nullptr);
-            st.setProperty (idP1, s.p1, nullptr);
-            st.setProperty (idP2, s.p2, nullptr);
-            pt.appendChild (st, nullptr);
-        }
+            pt.appendChild (stepToTree (b.patterns[(size_t) p][(size_t) i], i), nullptr);
         root.appendChild (pt, nullptr);
     }
+
+    juce::ValueTree live (idLive);
+    for (int t = 0; t < gn::kNumStutterTypes; ++t)
+        live.appendChild (stepToTree (b.live[(size_t) t], t), nullptr);
+    root.appendChild (live, nullptr);
     return root;
 }
 
@@ -343,18 +411,22 @@ void GlitchNastyProcessor::patternsFromTree (const juce::ValueTree& root, gn::Pa
             const int i = st.getProperty (idI, -1);
             if (! st.hasType (idS) || i < 0 || i >= gn::kMaxSteps)
                 continue;
-            auto& s = b.patterns[(size_t) p][(size_t) i];
-            s.on       = st.getProperty (idOn, false);
-            s.chance   = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idChance, 1.0f));
-            s.division = juce::jlimit (0, gn::kNumDivisions - 1, (int) st.getProperty (idDiv, gn::kDiv32));
-            s.type     = juce::jlimit (0, gn::kNumStutterTypes - 1, (int) st.getProperty (idType, 0));
-            s.length   = juce::jlimit (1, gn::kMaxSteps, (int) st.getProperty (idLen, 1));
-            s.levelDb  = juce::jlimit (gn::kLevelMinDb, gn::kLevelMaxDb, (float) st.getProperty (idLevel, 0.0f));
-            s.pan      = juce::jlimit (-1.0f, 1.0f, (float) st.getProperty (idPan, 0.0f));
-            s.filter   = juce::jlimit (-1.0f, 1.0f, (float) st.getProperty (idFilter, 0.0f));
-            s.p1       = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idP1, gn::kTypeInfo[(size_t) s.type].p1Default));
-            s.p2       = juce::jlimit (0.0f, 1.0f, (float) st.getProperty (idP2, gn::kTypeInfo[(size_t) s.type].p2Default));
+            stepFromTree (st, b.patterns[(size_t) p][(size_t) i]);
         }
+    }
+
+    // Live pad settings (sessions from before 0.3 keep the factory pads).
+    const auto defaults = gn::makeDefaultBank();
+    b.live = defaults.live;
+    const auto live = root.getChildWithName (idLive);
+    for (const auto& st : live)
+    {
+        const int t = st.getProperty (idI, -1);
+        if (! st.hasType (idS) || t < 0 || t >= gn::kNumStutterTypes)
+            continue;
+        stepFromTree (st, b.live[(size_t) t]);
+        b.live[(size_t) t].type = t;
+        b.live[(size_t) t].on = true;
     }
 }
 

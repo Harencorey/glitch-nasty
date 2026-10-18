@@ -2,9 +2,11 @@
 //==============================================================================
 // Glitch Nasty - step editor.
 //
-// Shows the selected step's controls: the two type-specific ones (their names,
-// ranges and readouts change with the type), then Length (ties), Level, Pan
-// and Filter. Edits go straight into the pattern.
+// Edits either a step of the pattern (click a step number) or a live pad's
+// own settings (click a pad). Shows the two type-specific controls (names,
+// ranges and readouts change with the type), then Length (ties), Level, Pan,
+// Filter, and the crusher (Bits, Rate) and the delay/reverb Send.
+// Edits apply straight away, even to a glitch that's already playing.
 //==============================================================================
 
 #include "PluginProcessor.h"
@@ -16,12 +18,15 @@ class StepEditor : public juce::Component,
 public:
     explicit StepEditor (GlitchNastyProcessor&);
 
-    void setStep (int newStep);
+    void setStep (int newStep);    // edit a step of the current pattern
+    void setLivePad (int type);    // edit a live pad's settings
+    bool isEditingLivePad() const noexcept { return liveTarget; }
+
     void paint (juce::Graphics&) override;
     void resized() override;
 
 private:
-    enum { kCtl1, kCtl2, kLength, kLevel, kPan, kFilter, kNumKnobs };
+    enum { kCtl1, kCtl2, kLength, kLevel, kPan, kFilter, kBits, kRate, kSend, kNumKnobs };
 
     void timerCallback() override;
     void refresh (bool force);
@@ -29,10 +34,15 @@ private:
     void knobChanged (int which);
     juce::String formatTypeControl (int which, double sliderValue) const;
     const gn::TypeControl& typeControl (int which) const;
+    gn::StepData readTarget() const;
+    void editTarget (const std::function<void (gn::StepData&)>& change);
 
     GlitchNastyProcessor& processor;
     std::array<gn::ui::Knob, kNumKnobs> knobs;
-    int step = 0, shownType = -1, shownPattern = -1, shownStep = -1;
+    int step = 0, liveType = 0;
+    bool liveTarget = false;
+    int shownType = -1, shownPattern = -1, shownStep = -1;
+    bool shownLive = false;
     bool updating = false;
     gn::StepData current;
 

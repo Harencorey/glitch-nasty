@@ -1,10 +1,11 @@
 # Glitch Nasty (Norka DSP)
 
 A tempo-synced, real-time glitch/stutter plug-in. Zero latency, so it works on a live guitar as well as on tracks.
-8 patterns of 16 steps, 11 glitch types each with their own controls, per-step level/pan/filter, ties, swing,
-steerable randomness, and live triggering from pads, MIDI notes and a footswitch.
+8 patterns of 16 steps, 11 glitch types each with their own controls, per-step level/pan/filter/crush/send, ties,
+swing, steerable randomness, a crusher, tempo-synced delay and reverb, and live triggering from pads, MIDI notes
+and a footswitch.
 
-Coming next: the crusher (bits / sample rate), the delay/reverb send, presets / A-B / undo.
+Coming next: presets / A-B / undo.
 
 ## Install (easiest)
 
@@ -65,13 +66,16 @@ Patterns are saved with the session. Sessions from 0.1.x open with their old ste
 **chance** bar (drag sideways to draw; double-click = 100 %). Click a step's **number** to edit it below.
 
 **Step editor:** two controls that depend on the type, then **Length** (tie the glitch over the following steps),
-**Level** (all the way down = mute), **Pan**, and **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
-only on the glitch, never the dry signal).
+**Level** (all the way down = mute), **Pan**, **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
+only on the glitch, never the dry signal), **Bits** and **Rate** (this glitch's crusher - set them per step to
+sequence the crush), and **Send** (how much of this glitch feeds the delay/reverb).
+Changes apply straight away, even to a glitch that's already playing (they glide over the X-Fade time, no clicks).
+The header shows how many repeats fit in the step: Roll, Fade, Ping-Pong decay and Shuffle need 2 or more to be heard.
 
 | Type | Control 1 | Control 2 |
 |---|---|---|
 | **Repeat** | Offset: which slice of the step gets looped | Variation: each repeat starts a little earlier, at random |
-| **Reverse** | Mode: Reverse / Ping-Pong (back, forth, back …) | Offset |
+| **Reverse** | Mode: Reverse / Ping-Pong (back to the slice start, then forward again, inside every repeat) | Offset |
 | **Gate** | Duty: 5–95 % open | Shape: Hard / Soft / Pump (ducks then swells, like sidechain) |
 | **Roll** | Direction: Speed Up / Slow Down | Curve: how fast it changes (×0.5 … ×0.9 per repeat) |
 | **Pitch** | Pitch: −24 … +24 semitones | Glide: −24 … +24 st bent across the step (risers / droppers) |
@@ -86,12 +90,26 @@ only on the glitch, never the dry signal).
 
 Hold a **pad** (or play a **MIDI note**) to glitch right now with that type - it overrides the pattern until you let go.
 **Repeat** sets the slice length; **Quantize** sets when it starts (Off = instantly, or on the next 1/16, 1/8, 1/4 or bar).
+Each pad has **its own settings**: clicking a pad opens them in the step editor (outlined pink), so you can set, say,
+the Pitch pad to -7 st with a high-pass and half send. Click a step number to go back to editing the pattern.
+Pad settings are saved with the session.
 
 | MIDI | Does |
 |---|---|
 | C3 … A#3 (60–70) | Hold to glitch: Repeat, Reverse, Gate, Roll, Pitch, Tape Stop, Fade, Shuffle, Freeze, Scratch, Ping-Pong |
 | C2 … G2 (48–55) | Switch to pattern A … H |
 | CC64 (sustain pedal) | Footswitch: toggle Engage on the next bar |
+
+## Effects
+
+| Section | Controls |
+|---|---|
+| **Crush** (global) | **Bits** (off, 16 → 1 bit), **Rate** (off, ÷1 → ÷64 sample rate, aliasing on purpose), **Mix**. Crushes the whole output, dry included. For crush on just the glitches, use Bits/Rate in the step editor. |
+| **Delay** | **Time** (tempo-synced 1/32 … 1/2, dotted and triplet), **Feedback** (soft-clipped, so high settings stay musical), **Tone** (filter in the feedback loop: darker or thinner repeats), **Ping-Pong**, **Mix** (0 = off). |
+| **Reverb** | **Size** (room → huge hall, about 0.4–9 s), **Damp** (bright → dark), **Mix** (0 = off). An 8-line feedback delay network. |
+| **Send / Feed** | **Glitches**: only the glitched audio (times each step's Send) feeds the delay and reverb, so tails spill out of the glitches while the straight signal stays dry. **Everything**: the whole output. |
+
+Tails keep ringing when the transport stops. With every Mix at 0 the effects are a true bypass.
 
 ## Build it yourself (Mac)
 
@@ -115,12 +133,15 @@ with that commit's notes. The version shows top-right in the plug-in window.
 
 - `Source/Pattern.h`: step/pattern data, the type table and how every control maps to real values (shared by engine and UI).
 - `Source/GlitchCore.h`: the whole audio path - clock, swing grid, patterns, ties, density, seed, MIDI/live, engage.
-- `Source/StutterEngine.h`: the always-recording buffer, the 11 types, crossfades, level/pan/filter.
+- `Source/StutterEngine.h`: the always-recording buffer, the 11 types, crossfades, level/pan/filter/crush/send.
+- `Source/Effects.h`: crusher, tempo-synced delay, FDN reverb.
 - `Source/GridScheduler.h`: finds the exact sample of each (swung) grid line in a block; handles loop jumps.
 - `Source/TripleBuffer.h`: hands pattern edits from the UI to the audio thread without locks.
 - `Source/Params.h`: automatable parameter IDs (don't rename after release: it breaks sessions).
 - `Source/PluginProcessor.*`: JUCE wrapper, session save/load (and 0.1.x migration), pattern tools.
-- `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `Theme.h`: the UI.
+- `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `FxPanel.*`, `Theme.h`: the UI.
 - `tests/test_engine.cpp`: offline tests - grid/swing accuracy, every type and control, level/pan/filter, ties,
   chance/density/seed, MIDI live/quantize/pattern switch/footswitch, never-the-future across 132 setting combinations,
-  click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread.
+  click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread,
+  live-pad settings, knob moves during a glitch, crusher levels/hold, delay echo timing/feedback/ping-pong,
+  glitch-only sends, reverb decay vs. design, FX bypass at mix 0.

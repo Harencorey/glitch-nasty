@@ -17,7 +17,7 @@ StepGrid::StepGrid (GlitchNastyProcessor& p) : processor (p)
 
 void StepGrid::setSelectedStep (int step)
 {
-    selected = juce::jlimit (0, gn::kMaxSteps - 1, step);
+    selected = juce::jlimit (-1, gn::kMaxSteps - 1, step); // -1 = a live pad is being edited
     repaint();
 }
 
@@ -111,6 +111,7 @@ void StepGrid::paint (juce::Graphics& g)
     const auto owner = coverOwners (pattern, active);
 
     // Selected column
+    if (selected >= 0)
     {
         const auto sel = columnBounds (selected);
         g.setColour (acid.withAlpha (0.06f));
