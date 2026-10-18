@@ -64,7 +64,7 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
                 "Internal: run on the BPM knob, always. In Standalone there's no host, so it always runs Internal.",
                 syncAttachment);
     setupCombo (gridBox, gridLabel, gn::ids::grid, "GRID",
-                "How long each step is. 16 steps of 1/16 = one bar of 4/4.", gridAttachment);
+                "How long each step is. 16 steps of 1/16 = one bar of 4/4; 1/4 = four bars.", gridAttachment);
 
     setupKnob (bpm, gn::ids::bpm, "BPM", "Internal tempo. Used in Standalone, or with Sync set to Internal. Tap the TAP button to set it.");
     setupKnob (steps, gn::ids::steps, "STEPS", "Pattern length. Steps past this are skipped (shown dim). Odd lengths drift against the bar for polyrhythms.");
@@ -83,7 +83,7 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
 
     addAndMakeVisible (grid);
 
-    setSize (960, 460);
+    setSize (960, 490);
     startTimerHz (10);
 }
 

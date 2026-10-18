@@ -21,6 +21,7 @@ GlitchNastyProcessor::GlitchNastyProcessor()
         pStepOn[(size_t) i]   = apvts.getRawParameterValue (ids::stepOn (i));
         pStepProb[(size_t) i] = apvts.getRawParameterValue (ids::stepProb (i));
         pStepDiv[(size_t) i]  = apvts.getRawParameterValue (ids::stepDiv (i));
+        pStepType[(size_t) i] = apvts.getRawParameterValue (ids::stepType (i));
     }
 }
 
@@ -58,6 +59,7 @@ void GlitchNastyProcessor::readParameters()
         s.on          = pStepOn[i]->load() > 0.5f;
         s.probability = pStepProb[i]->load() * 0.01f;
         s.division    = (int) pStepDiv[i]->load();
+        s.type        = (int) pStepType[i]->load();
     }
 }
 

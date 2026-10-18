@@ -53,16 +53,33 @@ around and wins its dice roll (**Chance**), the plug-in grabs the audio from the
 |---|---|
 | **Sync** | **Host:** follows the DAW's tempo and position, re-locks after loop/cycle jumps, passes audio straight through while stopped. **Internal:** always runs on the BPM knob (use this to glitch live input in a DAW with the transport stopped). Standalone always runs Internal. |
 | **BPM / TAP** | Internal tempo. TAP averages your last 4 taps; every tap also snaps the grid to the nearest beat so you can lock it to a drummer. A 2 s pause starts a new count. Greyed out while the host clock is driving. |
-| **Grid** | Step length: 1/8, 1/16, 1/32, 1/8T, 1/16T. |
+| **Grid** | Step length: 1/4, 1/8, 1/16, 1/32, 1/8T, 1/16T. With 1/4, the 16 steps cover four bars. |
 | **Steps** | Pattern length (1–16). Odd lengths drift against the bar for polyrhythms. |
 | **X-Fade** | Loop crossfade, 0–20 ms. It's automatically limited to half the step/repeat so short repeats stay tight. |
 | **Mix** | How much glitch you hear while a step fires (between glitches it's always 100 % dry). |
 | **Output** | −24 to +12 dB trim. |
 
-**Step grid:** click a pad to switch a step on/off (drag across to paint). Drag a **chance** bar up/down. Drag sideways to
-draw across steps; double-click = 100 %. Click the **repeat** box for 1/4 … 1/64 including dotted and triplets.
+**Step grid:** click a pad to switch a step on/off (drag across to paint). Click the **type** box to pick what the glitch
+does (below). Drag a **chance** bar up/down. Drag sideways to draw across steps; double-click = 100 %. Click the
+**repeat** box for 1/4 … 1/64 including dotted and triplets.
 The step number lights green as the playhead passes and pink while that step is glitching. Hover anything for ~3 s for help.
-Every step's on/chance/repeat is a real parameter, so you can automate it.
+Every step's on/type/chance/repeat is a real parameter, so you can automate it.
+
+**Stutter types** (all zero-latency: the first pass of every step is the live signal):
+
+| Type | What it does |
+|---|---|
+| **Repeat** (RPT) | Loops the first *repeat length* of the step until the step ends. |
+| **Reverse** (REV) | Same slice, played backwards on every repeat. |
+| **Gate** | No looping: chops the live signal, open for the first half of each repeat length, silent for the second. Edges use the X-Fade ramp. |
+| **Roll** | Each repeat is half as long as the one before (1/16 → 1/32 → 1/64 …), bottoming out at 1/128. The build-up roll; best on a long step (1/4 or 1/8 grid). |
+| **Pitch +12** (PIT+) | Repeats at double speed: the whole slice an octave up, twice as often. |
+| **Pitch −12** (PIT−) | Repeats at half speed: the first half of the slice, an octave down, same rhythm. |
+| **Tape Stop** (STOP) | No looping: the audio slows to a halt over the repeat length, the level dropping in the last quarter like a real deck, then silence until the step ends. |
+| **Fade** | Each repeat 0.6× the level of the last (−4.4 dB per repeat), like an echo dying out. |
+
+Measured: every type plays exactly the expected samples, and with the default 3 ms X-Fade none of them clicks
+(on a 440 Hz sine, no sample step bigger than the sine itself; Pitch +12 is twice the sine's, since it *is* an octave up).
 
 ## Files
 

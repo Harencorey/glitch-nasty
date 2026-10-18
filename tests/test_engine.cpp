@@ -166,8 +166,9 @@ static void testBlockSizeIndependence()
 {
     std::printf ("Block-size independence\n");
     gn::CoreParams p;
-    for (int i = 0; i < 16; ++i) p.steps[(size_t) i] = { (i % 3) != 1, 1.0f, (i * 3) % gn::kNumDivisions };
-    p.gridIndex = 4; // 1/16T
+    for (int i = 0; i < 16; ++i)
+        p.steps[(size_t) i] = { (i % 3) != 1, 1.0f, (i * 3) % gn::kNumDivisions, i % gn::kNumStutterTypes };
+    p.gridIndex = 5; // 1/16T
 
     RunConfig a; a.sampleRate = 44100.0; a.bpm = 137.0;
     RunConfig b = a; b.fixedBlock = 1;
@@ -190,6 +191,124 @@ static double maxJump (const std::vector<float>& v)
     double m = 0.0;
     for (size_t n = 1; n < v.size(); ++n) m = std::max (m, (double) std::abs (v[n] - v[n - 1]));
     return m;
+}
+
+// 3b) Every stutter type does what it says (counter input decodes the playback position).
+static std::vector<float> runAllSteps (gn::StutterType type, int grid, int division,
+                                       const std::vector<float>& in, float xfadeMs = 0.0f)
+{
+    gn::CoreParams p;
+    p.gridIndex = grid;
+    p.crossfadeMs = xfadeMs;
+    for (auto& s : p.steps) s = { true, 1.0f, division, (int) type };
+    return run (in, p, RunConfig {});
+}
+
+static void testTypes()
+{
+    using T = gn::StutterType;
+    std::printf ("Stutter types (48k, 120 BPM)\n");
+    const auto counter = counterSignal (48000 * 4);
+    const int G16 = 2, G4 = 0, D16 = 5, D32 = 7;
+
+    // Max |output - expected| over the repeats of every 1/16 step (6000 samples, slice 3000).
+    auto check16 = [&] (const char* name, T type, auto expectedOffset)
+    {
+        const auto out = runAllSteps (type, G16, D32, counter);
+        double worst = 0.0;
+        for (size_t n = 6000; n + 1 < out.size(); ++n)
+        {
+            const double S = (double) (n / 6000 * 6000), e = (double) n - S;
+            const double expect = e < 3000 ? (double) n : S + expectedOffset (e - 3000);
+            worst = std::max (worst, std::abs ((double) out[n] - expect));
+        }
+        CHECK (worst < 0.1, "%s: playback off by %.2f samples", name, worst);
+        std::printf ("  %-10s plays the right samples (worst error %.3f)\n", name, worst);
+    };
+    check16 ("Reverse",   T::reverse,   [] (double r) { return 2999.0 - r; });
+    check16 ("Pitch +12", T::pitchUp,   [] (double r) { return 2.0 * std::fmod (r, 1500.0); });
+    check16 ("Pitch -12", T::pitchDown, [] (double r) { return 0.5 * r; });
+
+    // Roll on a 1/4 grid from 1/16: 6000 live, then repeats of 3000, 1500, 750, 750 ... (1/128 floor)
+    {
+        const auto out = runAllSteps (T::roll, G4, D16, counter);
+        double worst = 0.0;
+        for (size_t n = 24000; n < out.size(); ++n)
+        {
+            const double S = (double) (n / 24000 * 24000), e = (double) n - S;
+            double expect = (double) n, t = 6000.0, len = 3000.0;
+            if (e >= 6000.0)
+            {
+                while (e >= t + len) { t += len; len = std::max (750.0, len * 0.5); }
+                expect = S + (e - t);
+            }
+            worst = std::max (worst, std::abs ((double) out[n] - expect));
+        }
+        CHECK (worst < 0.1, "Roll: playback off by %.2f samples", worst);
+        std::printf ("  %-10s halves each repeat down to 1/128 (worst error %.3f)\n", "Roll", worst);
+    }
+
+    // Tape Stop over a whole 1/16 step: position = integral of a speed falling 1 -> 0.
+    {
+        const auto out = runAllSteps (T::tapeStop, G16, D16, counter);
+        double worst = 0.0, tail = 0.0;
+        for (size_t n = 6000; n < out.size(); ++n)
+        {
+            const double S = (double) (n / 6000 * 6000), e = (double) n - S;
+            const double pos = S + e - e * (e - 1.0) / (2.0 * 6000.0);
+            const double rate = 1.0 - e / 6000.0;
+            const double gain = std::min (1.0, rate * 4.0);
+            if (e < 4400) worst = std::max (worst, std::abs ((double) out[n] - pos));
+            else          tail = std::max (tail, std::abs ((double) out[n] - pos * gain));
+        }
+        CHECK (worst < 0.1 && tail < 0.1, "Tape Stop: off by %.3f / %.3f", worst, tail);
+        std::printf ("  %-10s decelerates to a stop (worst error %.3f)\n", "Tape Stop", std::max (worst, tail));
+    }
+
+    // Gate: open for the first half of every 1/32, silent for the second half.
+    {
+        std::vector<float> sine (48000 * 2);
+        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (0.05 * (double) n);
+        const auto out = runAllSteps (T::gate, G16, D32, sine);
+        double worst = 0.0;
+        for (size_t n = 0; n < out.size(); ++n)
+        {
+            const bool open = (n % 3000) < 1500;
+            worst = std::max (worst, (double) std::abs (out[n] - (open ? sine[n] : 0.0f)));
+        }
+        CHECK (worst < 1.0e-6, "Gate: off by %g", worst);
+        std::printf ("  %-10s open/closed exactly on the 1/64 grid\n", "Gate");
+    }
+
+    // Fade: each repeat 0.6x the one before.
+    {
+        std::vector<float> sine (48000 * 2);
+        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (2.0 * M_PI * 1000.0 * (double) n / 48000.0);
+        const auto out = runAllSteps (T::fade, G4, D16, sine);
+        auto rms = [&] (size_t a, size_t b) { double s = 0; for (size_t n = a; n < b; ++n) s += (double) out[n] * out[n]; return std::sqrt (s / (double) (b - a)); };
+        const double r0 = rms (24000, 30000), r1 = rms (30000, 36000), r2 = rms (36000, 42000), r3 = rms (42000, 48000);
+        const bool ok = std::abs (r1 / r0 - 0.6) < 0.01 && std::abs (r2 / r0 - 0.36) < 0.01 && std::abs (r3 / r0 - 0.216) < 0.01;
+        CHECK (ok, "Fade levels %.3f %.3f %.3f", r1 / r0, r2 / r0, r3 / r0);
+        std::printf ("  %-10s repeats at %.2f, %.2f, %.2f of the first pass\n", "Fade", r1 / r0, r2 / r0, r3 / r0);
+    }
+
+    // No clicks: with the default 3 ms crossfade every type stays smooth on a sine.
+    {
+        std::vector<float> sine (48000 * 3);
+        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (2.0 * M_PI * 440.0 * (double) n / 48000.0);
+        const double clean = maxJump (sine);
+        bool allSmooth = true;
+        std::printf ("  biggest sample step with 3 ms fades (input %.3f):", clean);
+        for (int t = 0; t < gn::kNumStutterTypes; ++t)
+        {
+            const double speed = (T) t == T::pitchUp ? 2.0 : 1.0;
+            const double j = maxJump (runAllSteps ((T) t, G16, 8, sine, 3.0f)); // 1/32T: never lines up with the sine
+            std::printf (" %s %.3f", gn::kTypeShortNames[t], j);
+            if (j > clean * speed * 1.6) { allSmooth = false; std::printf ("(!)"); }
+        }
+        std::printf ("\n");
+        CHECK (allSmooth, "a stutter type clicks with a 3 ms crossfade");
+    }
 }
 
 static void testCrossfade()
@@ -299,10 +418,12 @@ static void testLoopJump()
 
 int main()
 {
-    testGridAccuracy (48000.0, 120.0, 1, 7, "48k, 120 BPM, grid 1/16, repeat 1/32");
-    testGridAccuracy (44100.0, 133.0, 4, 9, "44.1k, 133 BPM, grid 1/16T, repeat 1/64");
-    testGridAccuracy (96000.0, 97.3, 0, 4, "96k, 97.3 BPM, grid 1/8, repeat 1/8T");
-    testGridAccuracy (88200.0, 174.0, 2, 9, "88.2k, 174 BPM, grid 1/32, repeat 1/64");
+    testGridAccuracy (48000.0, 120.0, 2, 7, "48k, 120 BPM, grid 1/16, repeat 1/32");
+    testGridAccuracy (44100.0, 133.0, 5, 9, "44.1k, 133 BPM, grid 1/16T, repeat 1/64");
+    testGridAccuracy (96000.0, 97.3, 1, 4, "96k, 97.3 BPM, grid 1/8, repeat 1/8T");
+    testGridAccuracy (88200.0, 174.0, 3, 9, "88.2k, 174 BPM, grid 1/32, repeat 1/64");
+    testGridAccuracy (48000.0, 90.0, 0, 3, "48k, 90 BPM, grid 1/4, repeat 1/16D");
+    testTypes();
     testBlockSizeIndependence();
     testCrossfade();
     testProbability();

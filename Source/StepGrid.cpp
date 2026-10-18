@@ -4,6 +4,7 @@ namespace
 {
 constexpr float kNumberH = 20.0f;
 constexpr float kPadH    = 46.0f;
+constexpr float kTypeH   = 22.0f;
 constexpr float kRepeatH = 24.0f;
 constexpr float kGap     = 6.0f;
 constexpr float kColumnPad = 3.0f;
@@ -17,6 +18,7 @@ StepGrid::StepGrid (GlitchNastyProcessor& p) : processor (p)
         s.on     = processor.apvts.getParameter (gn::ids::stepOn (i));
         s.chance = processor.apvts.getParameter (gn::ids::stepProb (i));
         s.repeat = processor.apvts.getParameter (gn::ids::stepDiv (i));
+        s.type   = processor.apvts.getParameter (gn::ids::stepType (i));
     }
     stepsParam = processor.apvts.getParameter (gn::ids::steps);
 
@@ -45,8 +47,10 @@ StepGrid::Row StepGrid::rowAt (float y) const
     const float h = (float) getHeight();
     if (y < kNumberH) return Row::number;
     if (y < kNumberH + kPadH) return Row::pad;
+    const float typeTop = kNumberH + kPadH + kGap;
+    if (y >= typeTop && y < typeTop + kTypeH) return Row::type;
     if (y >= h - kRepeatH) return Row::repeat;
-    if (y >= kNumberH + kPadH + kGap && y < h - kRepeatH - kGap) return Row::chance;
+    if (y >= typeTop + kTypeH + kGap && y < h - kRepeatH - kGap) return Row::chance;
     return Row::none;
 }
 
@@ -61,7 +65,12 @@ juce::Rectangle<float> StepGrid::cell (int column, Row row) const
     {
         case Row::number: return { x, 0.0f, cw, kNumberH };
         case Row::pad:    return { x, kNumberH, cw, kPadH };
-        case Row::chance: return { x, kNumberH + kPadH + kGap, cw, h - kNumberH - kPadH - kRepeatH - 2.0f * kGap };
+        case Row::type:   return { x, kNumberH + kPadH + kGap, cw, kTypeH };
+        case Row::chance:
+        {
+            const float top = kNumberH + kPadH + kTypeH + 2.0f * kGap;
+            return { x, top, cw, h - top - kRepeatH - kGap };
+        }
         case Row::repeat: return { x, h - kRepeatH, cw, kRepeatH };
         case Row::none:   break;
     }
@@ -104,12 +113,21 @@ void StepGrid::paint (juce::Graphics& g)
         g.setColour (outline.withMultipliedAlpha (alpha));
         g.drawRoundedRectangle (pad, 4.0f, 1.0f);
 
+        // Stutter type
+        const int type = juce::roundToInt (s.type->convertFrom0to1 (s.type->getValue()));
+        auto typeCell = cell (i, Row::type);
+        g.setColour (panel);
+        g.fillRoundedRectangle (typeCell, 3.0f);
+        g.setColour ((on ? (type == 0 ? text : nasty.brighter (0.3f)) : dimText).withMultipliedAlpha (alpha));
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.drawText (gn::kTypeShortNames[juce::jlimit (0, gn::kNumStutterTypes - 1, type)], typeCell, juce::Justification::centred);
+
         // Chance bar
         auto bar = cell (i, Row::chance);
         g.setColour (panel);
         g.fillRoundedRectangle (bar, 3.0f);
         auto fill = bar.withTop (bar.getBottom() - bar.getHeight() * chance);
-        g.setColour (on ? acid.withAlpha (0.55f * alpha) : dimText.withAlpha (0.16f * alpha));
+        g.setColour (on ? acid.withAlpha (0.55f * alpha) : dimText.withAlpha (0.08f * alpha));
         g.fillRoundedRectangle (fill, 3.0f);
         g.setColour (outline.withMultipliedAlpha (alpha));
         g.drawRoundedRectangle (bar, 3.0f, 1.0f);
@@ -201,7 +219,8 @@ void StepGrid::mouseDown (const juce::MouseEvent& e)
             setChanceFromY (col, pos.y);
             break;
         case Row::repeat:
-            showRepeatMenu (col);
+        case Row::type:
+            showChoiceMenu (col, rowAt (pos.y));
             break;
         case Row::number:
         case Row::none:
@@ -242,19 +261,21 @@ void StepGrid::mouseDoubleClick (const juce::MouseEvent& e)
     p->endChangeGesture();
 }
 
-void StepGrid::showRepeatMenu (int column)
+void StepGrid::showChoiceMenu (int column, Row row)
 {
-    auto* p = steps[(size_t) column].repeat;
+    const bool isType = (row == Row::type);
+    auto* p = isType ? steps[(size_t) column].type : steps[(size_t) column].repeat;
     const int current = juce::roundToInt (p->convertFrom0to1 (p->getValue()));
 
     juce::PopupMenu menu;
-    menu.addSectionHeader ("Step " + juce::String (column + 1) + " repeat");
-    for (int i = 0; i < gn::kNumDivisions; ++i)
-        menu.addItem (i + 1, gn::kDivisionNames[i], true, i == current);
+    menu.addSectionHeader ("Step " + juce::String (column + 1) + (isType ? " type" : " repeat"));
+    const int count = isType ? gn::kNumStutterTypes : gn::kNumDivisions;
+    for (int i = 0; i < count; ++i)
+        menu.addItem (i + 1, isType ? gn::kTypeNames[i] : gn::kDivisionNames[i], true, i == current);
 
     juce::Component::SafePointer<StepGrid> safe (this);
     menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (this)
-                                                  .withTargetScreenArea (localAreaToGlobal (cell (column, Row::repeat).toNearestInt())),
+                                                  .withTargetScreenArea (localAreaToGlobal (cell (column, row).toNearestInt())),
                         [safe, p] (int result)
                         {
                             if (safe == nullptr || result <= 0)
@@ -272,8 +293,11 @@ juce::String StepGrid::getTooltip()
     {
         case Row::number: return "Step number. Lights green as the playhead passes, pink while that step is glitching.";
         case Row::pad:    return "Click to switch the step on or off. Click and drag across steps to paint several at once.";
+        case Row::type:   return "What the glitch does. Repeat: loops the slice. Reverse: plays it backwards. Gate: chops the live signal on/off. "
+                                 "Roll: each repeat half as long (build-up). Pitch +12/-12: repeats an octave up/down. "
+                                 "Tape Stop: slows to a halt over the repeat length. Fade: each repeat quieter.";
         case Row::chance: return "Chance this step glitches each time it comes around. Drag up/down; drag sideways to draw across steps. Double-click = 100%.";
-        case Row::repeat: return "Repeat length: the slice that loops for the rest of the step. Shorter = faster stutter. Click to choose.";
+        case Row::repeat: return "Repeat length: the slice that loops for the rest of the step (Gate: the on/off cycle; Tape Stop: how long it takes to stop). Click to choose.";
         case Row::none:   break;
     }
     return {};

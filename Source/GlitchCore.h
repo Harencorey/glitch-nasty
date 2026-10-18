@@ -21,9 +21,10 @@ namespace gn
 constexpr int kMaxSteps = 16;
 
 // Grid = how long each step is.
-constexpr int kNumGrids = 5;
-constexpr const char* kGridNames[kNumGrids] = { "1/8", "1/16", "1/32", "1/8T", "1/16T" };
-constexpr double kGridPpq[kNumGrids]        = { 0.5, 0.25, 0.125, 1.0 / 3.0, 1.0 / 6.0 };
+constexpr int kNumGrids = 6;
+constexpr const char* kGridNames[kNumGrids] = { "1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T" };
+constexpr double kGridPpq[kNumGrids]        = { 1.0, 0.5, 0.25, 0.125, 1.0 / 3.0, 1.0 / 6.0 };
+constexpr int kDefaultGrid = 2; // 1/16
 
 // Repeat = length of the slice that loops inside a step. Longest first.
 constexpr int kNumDivisions = 10;
@@ -34,18 +35,25 @@ constexpr double kDivisionPpq[kNumDivisions] = {
     1.0, 0.75, 0.5, 0.375, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0, 0.0625
 };
 
+// What each step does when it fires. Short names fit the grid; long names go in menus.
+constexpr const char* kTypeShortNames[kNumStutterTypes] = { "RPT", "REV", "GATE", "ROLL", "PIT+", "PIT-", "STOP", "FADE" };
+constexpr const char* kTypeNames[kNumStutterTypes] = {
+    "Repeat", "Reverse", "Gate", "Roll", "Pitch +12", "Pitch -12", "Tape Stop", "Fade"
+};
+
 struct StepSettings
 {
     bool on = false;
     float probability = 1.0f; // 0..1
     int division = 7;         // index into kDivisionPpq (1/32)
+    int type = 0;             // StutterType
 };
 
 struct CoreParams
 {
     int syncMode = 0;          // 0 = Host (falls back to Internal when there's no host clock), 1 = Internal
     double internalBpm = 120.0;
-    int gridIndex = 1;         // 1/16
+    int gridIndex = kDefaultGrid;
     int numSteps = 16;
     float crossfadeMs = 3.0f;
     float mix = 1.0f;          // 0..1
@@ -175,8 +183,14 @@ private:
 
         if (fire)
         {
-            const int div = std::clamp (s.division, 0, kNumDivisions - 1);
-            engine.startStutter (kDivisionPpq[div] * samplesPerQuarter, fade, lateBy, stepSamples);
+            StutterSettings st;
+            st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
+            st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * samplesPerQuarter;
+            st.stepLen = stepSamples;
+            st.lateBy = lateBy;
+            st.minPeriod = samplesPerQuarter / 32.0; // Roll bottoms out at 1/128 notes
+            st.fadeSamples = fade;
+            engine.startStutter (st);
             firingStep = idx;
         }
         else

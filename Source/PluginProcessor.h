@@ -61,7 +61,7 @@ private:
     std::atomic<float>* pXfade = nullptr;
     std::atomic<float>* pMix = nullptr;
     std::atomic<float>* pOutput = nullptr;
-    std::array<std::atomic<float>*, gn::kMaxSteps> pStepOn {}, pStepProb {}, pStepDiv {};
+    std::array<std::atomic<float>*, gn::kMaxSteps> pStepOn {}, pStepProb {}, pStepDiv {}, pStepType {};
 
     void readParameters();
 

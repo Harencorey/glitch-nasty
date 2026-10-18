@@ -5,6 +5,7 @@
 // Each column is one step:
 //   number   lights up as the playhead passes; magenta when that step is glitching
 //   pad      click to switch the step on/off (click-drag paints across steps)
+//   type     click for the stutter type menu (Repeat, Reverse, Gate, Roll ...)
 //   chance   drag up/down for the probability (drag across steps to draw a curve);
 //            double-click = 100 %
 //   repeat   click for the repeat length menu
@@ -40,7 +41,7 @@ public:
     juce::String getTooltip() override;
 
 private:
-    enum class Row { none, number, pad, chance, repeat };
+    enum class Row { none, number, pad, type, chance, repeat };
     enum class DragMode { none, paintPads, drawChance };
 
     struct StepParams
@@ -48,6 +49,7 @@ private:
         juce::RangedAudioParameter* on = nullptr;
         juce::RangedAudioParameter* chance = nullptr;
         juce::RangedAudioParameter* repeat = nullptr;
+        juce::RangedAudioParameter* type = nullptr;
     };
 
     void timerCallback() override;
@@ -61,7 +63,7 @@ private:
     void touch (int column, juce::RangedAudioParameter* p);
     void releaseAllGestures();
     void setChanceFromY (int column, float y);
-    void showRepeatMenu (int column);
+    void showChoiceMenu (int column, Row row);
 
     GlitchNastyProcessor& processor;
     std::array<StepParams, gn::kMaxSteps> steps;
