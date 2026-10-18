@@ -1,8 +1,10 @@
 # Glitch Nasty (Norka DSP)
 
 A tempo-synced, real-time glitch/stutter plug-in. Zero latency, so it works on a live guitar as well as on tracks.
-**Phase 1:** clock, step pattern with per-step chance, stutter engine. Coming next: the crusher (bits / sample rate),
-glitch modifiers (reverse, gate, varispeed, tape stop), the delay/reverb send, then the step sequencer for bits/SR/pitch.
+8 patterns of 16 steps, 11 glitch types each with their own controls, per-step level/pan/filter, ties, swing,
+steerable randomness, and live triggering from pads, MIDI notes and a footswitch.
+
+Coming next: the crusher (bits / sample rate), the delay/reverb send, presets / A-B / undo.
 
 ## Install (easiest)
 
@@ -10,6 +12,86 @@ Download **GlitchNasty-Installer.pkg** from the latest release: https://github.c
 It isn't Apple-notarized yet, so the first time macOS blocks it: **System Settings > Privacy & Security > Open Anyway**
 (or right-click the .pkg and choose **Open**). The Standalone app is **GlitchNasty-Standalone.app.zip** on the same page.
 Every past version stays downloadable at https://github.com/Harencorey/glitch-nasty/releases.
+
+**Standalone / live:**
+- The first time, macOS asks for microphone access. Say yes, or the input is silent.
+- JUCE's standalone starts with **input muted** (the yellow bar) to stop laptop-mic feedback. Click **Settings…**, pick your interface, and untick mute. It remembers.
+- To use MIDI (pad controller, keyboard, footswitch), enable the MIDI input in the same **Settings…** window.
+- Keep the buffer at 64–128 samples for playing live. The plug-in adds no latency of its own.
+
+## How it works
+
+Each step on the grid is one division of the bar (Grid = 1/16 → 16 steps = one bar). When a step that's on comes
+around and wins its dice roll (**Chance**), the plug-in grabs the audio from the start of that step and does what the
+step's **Type** says for the rest of the step (or longer, if it's tied), using slices of **Repeat** length.
+Then it's straight back to the live signal.
+
+- **Zero latency:** the first pass of every repeat *is* the live input; only the replays come from the buffer.
+  Types that rearrange audio (Shuffle, Scratch, Freeze) only ever use audio that has already happened - tested across
+  every type and setting.
+- **On the grid:** loop points land within 1 sample of the true (swung) grid at any tempo and sample rate.
+  Output is bit-identical whatever buffer size the host uses.
+- **Between glitches** the signal is untouched (bit-identical).
+
+## Global controls
+
+| Control | What it does |
+|---|---|
+| **Sync** | **Host:** follows the DAW's tempo, position and time signature; re-locks after loop/cycle jumps; passes audio straight through while stopped. **Internal:** always runs on the BPM knob (use this to glitch live input in a DAW with the transport stopped). Standalone always runs Internal. |
+| **BPM / TAP** | Internal tempo. TAP averages your last 4 taps; every tap also snaps the grid to the nearest beat. |
+| **Grid** | Step length: 1/4, 1/8, 1/16, 1/32, 1/8T, 1/16T. |
+| **Steps** | Pattern length (1–16). Odd lengths drift against the bar for polyrhythms. |
+| **Swing** | 50 % = straight, 66 % = triplet feel, 75 % = hard shuffle (every second step pushed late, MPC-style). |
+| **X-Fade** | Crossfade at every loop point, 0–20 ms (3 ms default = click-free). |
+| **Mix** | How much glitch you hear while a step fires. |
+| **Density** | Scales every step's chance: −100 % = nothing fires, +100 % = every on-step fires. Automate it into a drop. |
+| **Seed** | The dice behind Chance, Variation, Shuffle and Freeze texture. Same seed = same decisions at the same song position, so a happy accident bounces the same every time. |
+| **Output** | −24 to +12 dB trim. |
+| **Engage** | Pattern on/off, applied on the next bar line. A sustain pedal / footswitch (MIDI CC64) toggles it too. |
+
+## Patterns
+
+Tabs **A–H** pick the pattern that plays and that you're editing (automatable as *Pattern*; MIDI C2–G2 also switch).
+Factory patterns: **A** basics, **B** build-up, **C** trance gate, **D** breaks, **E** pitch riser/dropper, **F** textures,
+**G** ping-pong echoes, **H** empty. Tools: **COPY / PASTE**, **< >** shift the pattern a step, **REV** reverse it,
+**CLEAR**, and **RANDOM** - roll a new pattern, keeping whatever you **LOCK** (on/off, type, repeat, chance, shape).
+
+Patterns are saved with the session. Sessions from 0.1.x open with their old steps in pattern A
+(their per-step automation lanes don't carry over - the steps are no longer separate parameters).
+
+## Steps
+
+**Grid:** click a pad to switch a step on/off (drag to paint). Click the **type** or **repeat** box for a menu. Drag a
+**chance** bar (drag sideways to draw; double-click = 100 %). Click a step's **number** to edit it below.
+
+**Step editor:** two controls that depend on the type, then **Length** (tie the glitch over the following steps),
+**Level** (all the way down = mute), **Pan**, and **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
+only on the glitch, never the dry signal).
+
+| Type | Control 1 | Control 2 |
+|---|---|---|
+| **Repeat** | Offset: which slice of the step gets looped | Variation: each repeat starts a little earlier, at random |
+| **Reverse** | Mode: Reverse / Ping-Pong (back, forth, back …) | Offset |
+| **Gate** | Duty: 5–95 % open | Shape: Hard / Soft / Pump (ducks then swells, like sidechain) |
+| **Roll** | Direction: Speed Up / Slow Down | Curve: how fast it changes (×0.5 … ×0.9 per repeat) |
+| **Pitch** | Pitch: −24 … +24 semitones | Glide: −24 … +24 st bent across the step (risers / droppers) |
+| **Tape Stop** | Direction: Stop / Start (spins up from nothing) | Curve: linear → exponential |
+| **Fade** | Decay: dB per repeat | Direction: Fade Out / Fade In (swell) |
+| **Shuffle** | Chaos: how many slices get swapped for earlier ones | Reverse: chance a swapped slice plays backwards |
+| **Freeze** | Grain: 10–200 ms | Texture: how much the grain wanders |
+| **Scratch** | Depth: how far it drags back | Speed: ½× / 1× / 2× per repeat length |
+| **Ping-Pong** | Width: how far left/right | Decay: dB per repeat |
+
+## Live
+
+Hold a **pad** (or play a **MIDI note**) to glitch right now with that type - it overrides the pattern until you let go.
+**Repeat** sets the slice length; **Quantize** sets when it starts (Off = instantly, or on the next 1/16, 1/8, 1/4 or bar).
+
+| MIDI | Does |
+|---|---|
+| C3 … A#3 (60–70) | Hold to glitch: Repeat, Reverse, Gate, Roll, Pitch, Tape Stop, Fade, Shuffle, Freeze, Scratch, Ping-Pong |
+| C2 … G2 (48–55) | Switch to pattern A … H |
+| CC64 (sustain pedal) | Footswitch: toggle Engage on the next bar |
 
 ## Build it yourself (Mac)
 
@@ -20,80 +102,25 @@ bash build_mac.sh                   # downloads JUCE 8.0.15 automatically
 
 Needs the Xcode command line tools and CMake (`brew install cmake`). It builds a universal **AU, VST3 and Standalone**,
 installs the plug-ins into `~/Library/Audio/Plug-Ins/`, and runs the engine tests. Look for **Norka DSP > Glitch Nasty**.
-Logic: `auval -v aumf Gnst Nrka`. It's a *music effect* (`aumf`), not `aufx`, because MIDI input is reserved for MIDI-triggered glitches later.
+Logic: `auval -v aumf Gnst Nrka` (a *music effect*, because it takes MIDI).
 
 ## Automated builds
 
-Every push to `main` builds on a GitHub macOS runner (`.github/workflows/build-mac.yml`) as version `0.1.<build number>`,
-the same pipeline as Glow: engine tests, universal-binary check, **GlitchNasty-Installer.pkg** (`packaging/make_pkg.sh`),
-a test install, Apple `auval` and pluginval at strictness 10. Then it publishes the **latest** release plus a permanent
-**v0.1.<build>** release with that commit's notes. The build number shows top-right in the plug-in window.
-
-**Standalone / live:** from the release zip, or `build-mac/GlitchNasty_artefacts/Release/Standalone/` if you built it.
-- The first time, macOS asks for microphone access. Say yes, or the input is silent.
-- JUCE's standalone starts with **input muted** (the yellow bar) to stop laptop-mic feedback. Click **Settings…**, pick your interface, and untick mute. It remembers.
-- Keep the buffer at 64–128 samples for playing live. The plug-in adds no latency of its own.
-
-## How it works
-
-Each step on the grid is one division of the bar (Grid = 1/16 → 16 steps = one bar). When a step that's on comes
-around and wins its dice roll (**Chance**), the plug-in grabs the audio from the start of that step and loops the first
-**Repeat** length of it until the step ends. Then it's straight back to the live signal.
-
-- **Zero latency:** the first pass of every repeat *is* the live input; only the replays come from the buffer.
-- **On the grid:** loop points land within 1 sample of the true grid at any tempo and sample rate (tested
-  44.1–96 kHz, odd tempos like 97.3 and 133 BPM, triplet grids). Output is bit-identical whatever buffer size the host uses.
-- **Crossfades:** every loop point and every return to live is an equal-power crossfade (X-FADE, default 3 ms).
-  Measured on a 440 Hz sine: 0 ms gives clicks of 0.89 (full scale = 1), 3 ms gives none (no step bigger than the sine itself).
-- **Between glitches** the signal is untouched (bit-identical), and with the transport stopped in Host sync it's a true bypass.
-
-## Controls
-
-| Control | What it does |
-|---|---|
-| **Sync** | **Host:** follows the DAW's tempo and position, re-locks after loop/cycle jumps, passes audio straight through while stopped. **Internal:** always runs on the BPM knob (use this to glitch live input in a DAW with the transport stopped). Standalone always runs Internal. |
-| **BPM / TAP** | Internal tempo. TAP averages your last 4 taps; every tap also snaps the grid to the nearest beat so you can lock it to a drummer. A 2 s pause starts a new count. Greyed out while the host clock is driving. |
-| **Grid** | Step length: 1/4, 1/8, 1/16, 1/32, 1/8T, 1/16T. With 1/4, the 16 steps cover four bars. |
-| **Steps** | Pattern length (1–16). Odd lengths drift against the bar for polyrhythms. |
-| **X-Fade** | Loop crossfade, 0–20 ms. It's automatically limited to half the step/repeat so short repeats stay tight. |
-| **Mix** | How much glitch you hear while a step fires (between glitches it's always 100 % dry). |
-| **Output** | −24 to +12 dB trim. |
-
-**Step grid:** click a pad to switch a step on/off (drag across to paint). Click the **type** box to pick what the glitch
-does (below). Drag a **chance** bar up/down. Drag sideways to draw across steps; double-click = 100 %. Click the
-**repeat** box for 1/4 … 1/64 including dotted and triplets.
-The step number lights green as the playhead passes and pink while that step is glitching. Hover anything for ~3 s for help.
-Every step's on/type/chance/repeat is a real parameter, so you can automate it.
-
-**Stutter types** (all zero-latency: the first pass of every step is the live signal):
-
-| Type | What it does |
-|---|---|
-| **Repeat** (RPT) | Loops the first *repeat length* of the step until the step ends. |
-| **Reverse** (REV) | Same slice, played backwards on every repeat. |
-| **Gate** | No looping: chops the live signal, open for the first half of each repeat length, silent for the second. Edges use the X-Fade ramp. |
-| **Roll** | Each repeat is half as long as the one before (1/16 → 1/32 → 1/64 …), bottoming out at 1/128. The build-up roll; best on a long step (1/4 or 1/8 grid). |
-| **Pitch +12** (PIT+) | Repeats at double speed: the whole slice an octave up, twice as often. |
-| **Pitch −12** (PIT−) | Repeats at half speed: the first half of the slice, an octave down, same rhythm. |
-| **Tape Stop** (STOP) | No looping: the audio slows to a halt over the repeat length, the level dropping in the last quarter like a real deck, then silence until the step ends. |
-| **Fade** | Each repeat 0.6× the level of the last (−4.4 dB per repeat), like an echo dying out. |
-
-Measured: every type plays exactly the expected samples, and with the default 3 ms X-Fade none of them clicks
-(on a 440 Hz sine, no sample step bigger than the sine itself; Pitch +12 is twice the sine's, since it *is* an octave up).
+Every push to `main` builds on a GitHub macOS runner (`.github/workflows/build-mac.yml`), the same pipeline as Glow:
+engine tests, universal-binary check, **GlitchNasty-Installer.pkg** (`packaging/make_pkg.sh`), a test install,
+Apple `auval` and pluginval at strictness 10. Then it publishes the **latest** release plus a permanent version release
+with that commit's notes. The version shows top-right in the plug-in window.
 
 ## Files
 
-- `Source/GlitchCore.h`: the whole audio path (clock → grid → pattern → engine). No JUCE, shared with the tests.
-- `Source/GridScheduler.h`: finds the exact sample of each grid line in a block; handles loop jumps.
-- `Source/StutterEngine.h`: the always-recording buffer, loop playback and crossfades.
-- `Source/Params.h`: parameter IDs and ranges (don't rename IDs after release: it breaks sessions).
-- `Source/PluginProcessor.*`, `Source/PluginEditor.*`, `Source/StepGrid.*`: the JUCE wrapper and UI.
-- `tests/test_engine.cpp`: offline tests (grid accuracy, block-size independence, clicks, chance, bypass, DAW loops,
-  zero allocations on the audio thread). They run automatically at the end of `build_mac.sh`.
-
-## Already set up for later phases
-
-- MIDI input is enabled now (unused), so adding MIDI-triggered glitches won't change the AU type and break sessions.
-- The engine reads the buffer with fractional positions, so varispeed/pitch and reverse slot straight in.
-- The dice use a seedable generator, so a "Seed" control for repeatable random patterns is a one-liner.
-- The undo manager is wired into the parameters, ready for Glow's undo/redo, A/B and preset bar in the UI phase.
+- `Source/Pattern.h`: step/pattern data, the type table and how every control maps to real values (shared by engine and UI).
+- `Source/GlitchCore.h`: the whole audio path - clock, swing grid, patterns, ties, density, seed, MIDI/live, engage.
+- `Source/StutterEngine.h`: the always-recording buffer, the 11 types, crossfades, level/pan/filter.
+- `Source/GridScheduler.h`: finds the exact sample of each (swung) grid line in a block; handles loop jumps.
+- `Source/TripleBuffer.h`: hands pattern edits from the UI to the audio thread without locks.
+- `Source/Params.h`: automatable parameter IDs (don't rename after release: it breaks sessions).
+- `Source/PluginProcessor.*`: JUCE wrapper, session save/load (and 0.1.x migration), pattern tools.
+- `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `Theme.h`: the UI.
+- `tests/test_engine.cpp`: offline tests - grid/swing accuracy, every type and control, level/pan/filter, ties,
+  chance/density/seed, MIDI live/quantize/pattern switch/footswitch, never-the-future across 132 setting combinations,
+  click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread.

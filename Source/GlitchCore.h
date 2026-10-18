@@ -2,12 +2,20 @@
 //==============================================================================
 // Glitch Nasty - GlitchCore
 //
-// The whole audio path in one JUCE-free class: clock -> grid scheduler ->
-// step pattern (with per-step probability) -> stutter engine.
-// The plug-in wrapper and the offline tests both run exactly this code.
+// The whole audio path in one JUCE-free class:
+//   clock -> grid (with swing) -> pattern (chance, density, seed, ties)
+//         -> stutter engine
+// plus live performance: MIDI notes / UI pads trigger glitches (optionally
+// quantised), MIDI notes switch patterns, and a footswitch (sustain pedal)
+// engages/disengages the pattern on the next bar line.
+//
+// Everything that happens inside a block (grid lines, MIDI, bar lines, live
+// quantise points) is processed in time order at its exact sample. The
+// plug-in wrapper and the offline tests both run exactly this code.
 //==============================================================================
 
 #include "GridScheduler.h"
+#include "Pattern.h"
 #include "StutterEngine.h"
 
 #include <algorithm>
@@ -18,86 +26,94 @@
 namespace gn
 {
 
-constexpr int kMaxSteps = 16;
+// Live quantise: when a held note / pad actually starts.
+constexpr int kNumQuants = 5;
+constexpr const char* kQuantNames[kNumQuants] = { "Off", "1/16", "1/8", "1/4", "1 Bar" };
+constexpr double kQuantPpq[kNumQuants] = { 0.0, 0.25, 0.5, 1.0, -1.0 /* one bar */ };
 
-// Grid = how long each step is.
-constexpr int kNumGrids = 6;
-constexpr const char* kGridNames[kNumGrids] = { "1/4", "1/8", "1/16", "1/32", "1/8T", "1/16T" };
-constexpr double kGridPpq[kNumGrids]        = { 1.0, 0.5, 0.25, 0.125, 1.0 / 3.0, 1.0 / 6.0 };
-constexpr int kDefaultGrid = 2; // 1/16
-
-// Repeat = length of the slice that loops inside a step. Longest first.
-constexpr int kNumDivisions = 10;
-constexpr const char* kDivisionNames[kNumDivisions] = {
-    "1/4", "1/8D", "1/8", "1/16D", "1/8T", "1/16", "1/16T", "1/32", "1/32T", "1/64"
-};
-constexpr double kDivisionPpq[kNumDivisions] = {
-    1.0, 0.75, 0.5, 0.375, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0, 0.0625
-};
-
-// What each step does when it fires. Short names fit the grid; long names go in menus.
-constexpr const char* kTypeShortNames[kNumStutterTypes] = { "RPT", "REV", "GATE", "ROLL", "PIT+", "PIT-", "STOP", "FADE" };
-constexpr const char* kTypeNames[kNumStutterTypes] = {
-    "Repeat", "Reverse", "Gate", "Roll", "Pitch +12", "Pitch -12", "Tape Stop", "Fade"
-};
-
-struct StepSettings
-{
-    bool on = false;
-    float probability = 1.0f; // 0..1
-    int division = 7;         // index into kDivisionPpq (1/32)
-    int type = 0;             // StutterType
-};
+// MIDI map
+constexpr int kLiveNoteBase = 60;    // C3 (middle C) .. A#3: hold to glitch with type 0..10
+constexpr int kPatternNoteBase = 48; // C2 .. G2: switch to pattern A..H
+constexpr int kFootswitchCC = 64;    // sustain pedal: toggle Engage on the next bar
 
 struct CoreParams
 {
     int syncMode = 0;          // 0 = Host (falls back to Internal when there's no host clock), 1 = Internal
     double internalBpm = 120.0;
     int gridIndex = kDefaultGrid;
-    int numSteps = 16;
+    int numSteps = kMaxSteps;
     float crossfadeMs = 3.0f;
     float mix = 1.0f;          // 0..1
     bool snapToBeat = false;   // one-shot from TAP: snap the internal clock to the nearest beat
-    std::array<StepSettings, kMaxSteps> steps {};
+    float swing = 0.5f;        // 0.5 = straight .. 0.75 = hard swing
+    float density = 0.0f;      // -1 (nothing fires) .. 0 (as drawn) .. +1 (every on-step fires)
+    int seed = 1;              // same seed = same "random" decisions at the same song position
+    int pattern = 0;           // 0..7 = A..H
+    bool engage = true;        // pattern on/off (live notes/pads always work)
+    int liveDivision = kDiv16; // repeat length for live notes/pads
+    int liveQuant = 1;         // index into kQuantPpq
 };
 
 struct HostTime
 {
     bool hasPpq = false, hasBpm = false, playing = false;
     double ppq = 0.0, bpm = 120.0;
+    int timeSigNum = 4, timeSigDen = 4;
+};
+
+struct MidiEvent
+{
+    int offset;              // sample inside the block
+    uint8_t status, data1, data2;
 };
 
 class GlitchCore
 {
 public:
-    // Longest slice: a 1/4 note at 20 BPM is 3 s; keep a little headroom.
-    static constexpr double kMaxSliceSeconds = 3.5;
+    static constexpr double kBufferSeconds = 10.0; // how far back the engine can reach
+    static constexpr int kMaxHeld = 16;
 
     void prepare (double sampleRate, int numChannels)
     {
         sr = sampleRate;
-        engine.prepare (numChannels, sampleRate, kMaxSliceSeconds);
+        engine.prepare (numChannels, sampleRate, kBufferSeconds);
         reset();
     }
 
     void reset()
     {
         engine.reset();
-        scheduler.reset();
+        stepSched.reset();
+        barSched.reset();
+        quantSched.reset();
         internalPpq = 0.0;
-        playingStep = -1;
-        firingStep = -1;
+        playingStep = firingStep = -1;
+        firingLen = 1;
+        tieRemaining = 0;
+        heldCount = 0;
+        liveType = pendingLive = -1;
+        lastPad = -1;
+        liveChanged = false;
+        patternOverride = -1;
+        lastParamPattern = -1;
+        footFlip = footDown = false;
+        engaged = engageTarget = true;
+        engageInit = false;
+        liveCounter = 0;
     }
 
-    void process (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host) noexcept
+    void process (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host,
+                  const PatternBank& bank, const MidiEvent* midi = nullptr, int numMidi = 0, int livePad = -1) noexcept
     {
+        params = &p;
+        bankPtr = &bank;
         engine.setMix (p.mix);
 
         // ---- Clock ---------------------------------------------------------
         hostClock = (p.syncMode == 0 && host.hasPpq && host.hasBpm);
         const double bpm = std::clamp (hostClock ? host.bpm : p.internalBpm, 20.0, 999.0);
         const bool running = hostClock ? host.playing : true;
-        const double samplesPerQuarter = sr * 60.0 / bpm;
+        spq = sr * 60.0 / bpm;
         effectiveBpm = bpm;
 
         double ppq = 0.0;
@@ -110,56 +126,138 @@ public:
             if (p.snapToBeat)
                 internalPpq = std::round (internalPpq);
             ppq = internalPpq;
-            internalPpq += (double) numSamples / samplesPerQuarter;
+            internalPpq += (double) numSamples / spq;
         }
 
-        const double stepPpq = kGridPpq[std::clamp (p.gridIndex, 0, kNumGrids - 1)];
-        const double stepSamples = samplesPerQuarter * stepPpq;
-        const int fade = fadeSamples (p.crossfadeMs, stepSamples);
+        const int tsNum = (hostClock && host.timeSigNum > 0) ? host.timeSigNum : 4;
+        const int tsDen = (hostClock && host.timeSigDen > 0) ? host.timeSigDen : 4;
+        barPpq = (double) tsNum * 4.0 / (double) tsDen;
+
+        stepPpq = kGridPpq[std::clamp (p.gridIndex, 0, kNumGrids - 1)];
+        samplesPerStep = spq * stepPpq;
+        swing = std::clamp (((double) p.swing - 0.5) * 2.0, 0.0, 0.5);
+        fade = fadeSamples (p.crossfadeMs, samplesPerStep);
+        seedBase = hash32 ((uint32_t) std::max (0, p.seed) * 2654435761u + 0x1234567u);
+
+        // ---- Pattern select & engage ---------------------------------------
+        if (p.pattern != lastParamPattern)
+        {
+            lastParamPattern = p.pattern;
+            patternOverride = -1; // moving the Pattern control takes back over from MIDI
+        }
+        engageTarget = p.engage != footFlip;
+        if (! engageInit)
+        {
+            engaged = engageTarget;
+            engageInit = true;
+        }
+
+        // ---- Live pad from the UI (behaves like one more held note) --------
+        if (livePad != lastPad)
+        {
+            if (lastPad >= 0) releaseHeld (kPadId);
+            if (livePad >= 0 && livePad < kNumStutterTypes) pressHeld (kPadId, livePad);
+            lastPad = livePad;
+            liveChanged = true;
+        }
 
         // ---- Transport stopped: straight through ---------------------------
         if (! running)
         {
+            for (int m = 0; m < numMidi; ++m)
+                handleMidi (midi[m], false);
+            engaged = engageTarget;
             engine.stopStutter (fade);
-            scheduler.reset();
-            playingStep = -1;
-            firingStep = -1;
+            liveType = pendingLive = -1;
+            tieRemaining = 0;
+            stepSched.reset();
+            barSched.reset();
+            quantSched.reset();
+            playingStep = firingStep = -1;
+            liveChanged = true; // re-check held notes when playback starts
             engine.process (io, numCh, 0, numSamples);
             return;
         }
 
-        // ---- Split the block at each grid line -----------------------------
-        bool resynced = false;
-        const int numEvents = scheduler.process (ppq, samplesPerQuarter, stepPpq, numSamples, events.data(), resynced);
+        // ---- Find every grid line, bar line and quantise point -------------
+        bool resynced = false, barResynced = false, quantResynced = false;
+        const int ns = stepSched.process (ppq, spq, stepPpq, swing, numSamples, stepEvents.data(), resynced);
+        const int nb = barSched.process (ppq, spq, barPpq, 0.0, numSamples, barEvents.data(), barResynced);
+
+        int nq = 0;
+        const int quant = std::clamp (p.liveQuant, 0, kNumQuants - 1);
+        if (quant > 0)
+            nq = quantSched.process (ppq, spq, kQuantPpq[quant] < 0.0 ? barPpq : kQuantPpq[quant], 0.0,
+                                     numSamples, quantEvents.data(), quantResynced);
+        else
+            quantSched.reset();
 
         if (resynced)
         {
             engine.stopStutter (fade);
             firingStep = -1;
-            playingStep = stepIndex (scheduler.currentStep(), p.numSteps);
+            tieRemaining = 0;
+            liveType = pendingLive = -1;
+            engaged = engageTarget; // starting / locating applies Engage right away
+            playingStep = stepIndex (stepSched.currentStep(), p.numSteps);
+            liveChanged = true;
         }
 
-        int cursor = 0;
-        for (int e = 0; e < numEvents; ++e)
+        if (liveChanged)
         {
-            const auto& ev = events[(size_t) e];
-            engine.process (io, numCh, cursor, ev.offset - cursor);
-            cursor = ev.offset;
-            triggerStep (ev.step, ev.lateBy, p, samplesPerQuarter, stepSamples, fade);
+            liveChanged = false;
+            updateLive (0.0);
+        }
+
+        // ---- Walk the block in time order ----------------------------------
+        // At the same sample: MIDI first, then bar lines, then steps, then
+        // quantise points (so a live note always wins over the pattern).
+        int im = 0, ib = 0, is = 0, iq = 0, cursor = 0;
+        for (;;)
+        {
+            int next = numSamples, which = -1;
+            auto consider = [&] (int offset, int kind)
+            {
+                offset = std::max (offset, cursor);
+                if (offset < next) { next = offset; which = kind; }
+            };
+            if (im < numMidi) consider (std::min (midi[im].offset, numSamples - 1), 0);
+            if (ib < nb)      consider (barEvents[(size_t) ib].offset, 1);
+            if (is < ns)      consider (stepEvents[(size_t) is].offset, 2);
+            if (iq < nq)      consider (quantEvents[(size_t) iq].offset, 3);
+            if (which < 0)
+                break;
+
+            engine.process (io, numCh, cursor, next - cursor);
+            cursor = next;
+
+            switch (which)
+            {
+                case 0: handleMidi (midi[im++], true); break;
+                case 1: onBar(); ++ib; break;
+                case 2: onStep (stepEvents[(size_t) is++]); break;
+                default: onQuant (quantEvents[(size_t) iq++]); break;
+            }
         }
         engine.process (io, numCh, cursor, numSamples - cursor);
     }
 
     // For the UI.
-    int getPlayingStep() const noexcept { return playingStep; }
-    int getFiringStep() const noexcept  { return firingStep; }
-    double getEffectiveBpm() const noexcept { return effectiveBpm; }
-    bool isUsingHostClock() const noexcept { return hostClock; }
-
-    // For tests: deterministic dice.
-    void setRandomSeed (uint32_t seed) noexcept { rngState = seed != 0 ? seed : 0x9E3779B9u; }
+    int getPlayingStep() const noexcept       { return playingStep; }
+    int getFiringStep() const noexcept        { return firingStep; }
+    int getFiringLength() const noexcept      { return firingLen; }
+    int getLiveType() const noexcept          { return liveType; }
+    int getEffectivePattern() const noexcept  { return currentPatternIndex(); }
+    bool isEngaged() const noexcept           { return engaged; }
+    bool isEngagePending() const noexcept     { return engaged != engageTarget; }
+    double getEffectiveBpm() const noexcept   { return effectiveBpm; }
+    bool isUsingHostClock() const noexcept    { return hostClock; }
 
 private:
+    static constexpr int kPadId = 1000;
+
+    struct Held { int id, type; };
+
     static int stepIndex (int64_t absStep, int numSteps) noexcept
     {
         const int64_t n = std::clamp (numSteps, 1, kMaxSteps);
@@ -172,53 +270,241 @@ private:
         return std::max (0, (int) std::lround (f));
     }
 
-    void triggerStep (int64_t absStep, double lateBy, const CoreParams& p, double samplesPerQuarter,
-                      double stepSamples, int fade) noexcept
+    int currentPatternIndex() const noexcept
     {
-        const int idx = stepIndex (absStep, p.numSteps);
+        if (patternOverride >= 0)
+            return patternOverride;
+        return params != nullptr ? std::clamp (params->pattern, 0, kNumPatterns - 1) : 0;
+    }
+
+    static float applyDensity (float chance, float density) noexcept
+    {
+        density = std::clamp (density, -1.0f, 1.0f);
+        return density < 0.0f ? chance * (1.0f + density) : chance + (1.0f - chance) * density;
+    }
+
+    //--------------------------------------------------------------------------
+    void onStep (const GridEvent& ev) noexcept
+    {
+        const int numSteps = std::clamp (params->numSteps, 1, kMaxSteps);
+        const int idx = stepIndex (ev.step, numSteps);
         playingStep = idx;
 
-        const auto& s = p.steps[(size_t) idx];
-        const bool fire = s.on && (s.probability >= 0.999f || nextRandom() < s.probability);
+        if (tieRemaining > 0) // still inside a tied glitch
+        {
+            --tieRemaining;
+            return;
+        }
 
-        if (fire)
+        if (liveType >= 0) // live notes/pads override the pattern
+            return;
+
+        if (! engaged)
         {
-            StutterSettings st;
-            st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
-            st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * samplesPerQuarter;
-            st.stepLen = stepSamples;
-            st.lateBy = lateBy;
-            st.minPeriod = samplesPerQuarter / 32.0; // Roll bottoms out at 1/128 notes
-            st.fadeSamples = fade;
-            engine.startStutter (st);
-            firingStep = idx;
+            stopPattern();
+            return;
         }
-        else
+
+        const StepData& s = bankPtr->patterns[(size_t) currentPatternIndex()][(size_t) idx];
+        if (! s.on)
         {
-            engine.stopStutter (fade);
-            firingStep = -1;
+            stopPattern();
+            return;
         }
+
+        const int len = std::clamp (s.length, 1, numSteps - idx);
+        tieRemaining = len - 1; // the following steps belong to this one, fire or not
+
+        const float chance = applyDensity (s.chance, params->density);
+        const float dice = rand01 (seedBase, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
+        if (! (chance >= 0.999f || dice < chance))
+        {
+            stopPattern();
+            return;
+        }
+
+        StutterSettings st;
+        st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
+        st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * spq;
+        st.stepLen = (GridScheduler::stepStart (ev.step + len, swing) - GridScheduler::stepStart (ev.step, swing)) * samplesPerStep;
+        st.lateBy = ev.lateBy;
+        st.minPeriod = spq / 32.0; // Roll bottoms out at 1/128 notes
+        st.fadeSamples = fade;
+        st.p1 = s.p1;
+        st.p2 = s.p2;
+        st.level = levelGain (s.levelDb);
+        st.pan = s.pan;
+        st.filter = s.filter;
+        st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + 0x68e31da4u));
+        engine.startStutter (st);
+
+        firingStep = idx;
+        firingLen = len;
     }
 
-    // xorshift32: tiny, allocation-free, and seedable (handy for a "seed" control later).
-    float nextRandom() noexcept
+    void stopPattern() noexcept
     {
-        rngState ^= rngState << 13;
-        rngState ^= rngState >> 17;
-        rngState ^= rngState << 5;
-        return (float) (rngState >> 8) * (1.0f / 16777216.0f);
+        engine.stopStutter (fade);
+        firingStep = -1;
     }
 
-    StutterEngine engine;
-    GridScheduler scheduler;
-    std::array<GridEvent, GridScheduler::kMaxEvents> events {};
+    void onBar() noexcept
+    {
+        if (engaged == engageTarget)
+            return;
 
-    double sr = 48000.0;
-    double internalPpq = 0.0;
-    double effectiveBpm = 120.0;
+        engaged = engageTarget;
+        if (! engaged && liveType < 0)
+        {
+            stopPattern();
+            tieRemaining = 0;
+        }
+    }
+
+    void onQuant (const GridEvent& ev) noexcept
+    {
+        if (pendingLive >= 0)
+        {
+            startLive (pendingLive, ev.lateBy);
+            pendingLive = -1;
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    void handleMidi (const MidiEvent& ev, bool running) noexcept
+    {
+        const int status = ev.status & 0xF0;
+        const int d1 = ev.data1 & 0x7F, d2 = ev.data2 & 0x7F;
+        const bool isLiveNote = d1 >= kLiveNoteBase && d1 < kLiveNoteBase + kNumStutterTypes;
+
+        if (status == 0x90 && d2 > 0)
+        {
+            if (d1 >= kPatternNoteBase && d1 < kPatternNoteBase + kNumPatterns)
+                patternOverride = d1 - kPatternNoteBase;
+            else if (isLiveNote)
+            {
+                pressHeld (d1, d1 - kLiveNoteBase);
+                if (running) updateLive (0.0);
+            }
+        }
+        else if (status == 0x80 || (status == 0x90 && d2 == 0))
+        {
+            if (isLiveNote)
+            {
+                releaseHeld (d1);
+                if (running) updateLive (0.0);
+            }
+        }
+        else if (status == 0xB0)
+        {
+            if (d1 == kFootswitchCC)
+            {
+                const bool down = d2 >= 64;
+                if (down && ! footDown)
+                {
+                    footFlip = ! footFlip;
+                    engageTarget = params->engage != footFlip;
+                    if (! running)
+                        engaged = engageTarget;
+                }
+                footDown = down;
+            }
+            else if (d1 == 120 || d1 == 123) // all sound / all notes off
+            {
+                int keep = 0;
+                for (int i = 0; i < heldCount; ++i)
+                    if (held[(size_t) i].id == kPadId)
+                        held[(size_t) keep++] = held[(size_t) i];
+                heldCount = keep;
+                if (running) updateLive (0.0);
+            }
+        }
+    }
+
+    void pressHeld (int id, int type) noexcept
+    {
+        releaseHeld (id);
+        if (heldCount < kMaxHeld)
+            held[(size_t) heldCount++] = { id, type };
+    }
+
+    void releaseHeld (int id) noexcept
+    {
+        int keep = 0;
+        for (int i = 0; i < heldCount; ++i)
+            if (held[(size_t) i].id != id)
+                held[(size_t) keep++] = held[(size_t) i];
+        heldCount = keep;
+    }
+
+    // The most recently pressed note/pad wins; releasing it falls back to the
+    // previous one still held, and releasing everything returns to the pattern.
+    void updateLive (double lateBy) noexcept
+    {
+        const int desired = heldCount > 0 ? held[(size_t) heldCount - 1].type : -1;
+
+        if (desired < 0)
+        {
+            pendingLive = -1;
+            if (liveType >= 0)
+            {
+                liveType = -1;
+                tieRemaining = 0;
+                stopPattern();
+            }
+            return;
+        }
+
+        if (desired == liveType)
+        {
+            pendingLive = -1;
+            return;
+        }
+
+        if (std::clamp (params->liveQuant, 0, kNumQuants - 1) == 0)
+            startLive (desired, lateBy);
+        else
+            pendingLive = desired;
+    }
+
+    void startLive (int type, double lateBy) noexcept
+    {
+        StutterSettings st;
+        st.type = (StutterType) std::clamp (type, 0, kNumStutterTypes - 1);
+        st.sliceLen = kDivisionPpq[std::clamp (params->liveDivision, 0, kNumDivisions - 1)] * spq;
+        st.stepLen = 1.0e15; // until released
+        st.lateBy = lateBy;
+        st.minPeriod = spq / 32.0;
+        st.fadeSamples = fade;
+        st.p1 = kTypeInfo[(size_t) st.type].p1Default;
+        st.p2 = kTypeInfo[(size_t) st.type].p2Default;
+        st.seed = hash32 (seedBase ^ (0xA5A5A5A5u + ++liveCounter));
+        engine.startStutter (st);
+
+        liveType = type;
+        firingStep = -1;
+    }
+
+    //--------------------------------------------------------------------------
+    StutterEngine engine;
+    GridScheduler stepSched, barSched, quantSched;
+    std::array<GridEvent, GridScheduler::kMaxEvents> stepEvents {}, barEvents {}, quantEvents {};
+    std::array<Held, kMaxHeld> held {};
+
+    const CoreParams* params = nullptr;
+    const PatternBank* bankPtr = nullptr;
+
+    double sr = 48000.0, spq = 24000.0, stepPpq = 0.25, samplesPerStep = 6000.0, swing = 0.0, barPpq = 4.0;
+    double internalPpq = 0.0, effectiveBpm = 120.0;
+    int fade = 0;
+    uint32_t seedBase = 0, liveCounter = 0;
     bool hostClock = false;
-    int playingStep = -1, firingStep = -1;
-    uint32_t rngState = 0x12345678u;
+
+    int playingStep = -1, firingStep = -1, firingLen = 1, tieRemaining = 0;
+    int heldCount = 0, liveType = -1, pendingLive = -1, lastPad = -1;
+    bool liveChanged = false;
+    int patternOverride = -1, lastParamPattern = -1;
+    bool footFlip = false, footDown = false, engaged = true, engageTarget = true, engageInit = false;
 };
 
 } // namespace gn

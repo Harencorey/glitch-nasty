@@ -1,17 +1,13 @@
 #pragma once
 
+#include "LivePanel.h"
+#include "PatternBar.h"
 #include "PluginProcessor.h"
+#include "StepEditor.h"
 #include "StepGrid.h"
+#include "Theme.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
-
-class GlitchNastyLookAndFeel : public juce::LookAndFeel_V4
-{
-public:
-    GlitchNastyLookAndFeel();
-    void drawRotarySlider (juce::Graphics&, int x, int y, int width, int height,
-                           float sliderPos, float startAngle, float endAngle, juce::Slider&) override;
-};
 
 class GlitchNastyEditor : public juce::AudioProcessorEditor,
                           private juce::Timer
@@ -26,15 +22,10 @@ public:
 private:
     using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+    using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
 
-    struct Knob
-    {
-        juce::Slider slider { juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow };
-        juce::Label label;
-        std::unique_ptr<SliderAttachment> attachment;
-    };
-
-    void setupKnob (Knob&, const char* paramId, const juce::String& name, const juce::String& help);
+    void attachKnob (gn::ui::Knob&, std::unique_ptr<SliderAttachment>&, const char* paramId, const juce::String& name,
+                     const juce::String& help, bool bipolar = false);
     void setupCombo (juce::ComboBox&, juce::Label&, const char* paramId, const juce::String& name, const juce::String& help,
                      std::unique_ptr<ComboAttachment>&);
     void timerCallback() override;
@@ -48,13 +39,23 @@ private:
     juce::Label syncLabel, gridLabel;
     std::unique_ptr<ComboAttachment> syncAttachment, gridAttachment;
 
-    Knob bpm, steps, xfade, mix, output;
+    gn::ui::Knob bpm, steps, swing, xfade, mix, density, seed, output;
+    std::unique_ptr<SliderAttachment> bpmAtt, stepsAtt, swingAtt, xfadeAtt, mixAtt, densityAtt, seedAtt, outputAtt;
+
     juce::TextButton tapButton { "TAP" };
     juce::Label clockReadout;
 
+    juce::TextButton engageButton { "ENGAGE" };
+    std::unique_ptr<ButtonAttachment> engageAttachment;
+    juce::Label engageStatus;
+
+    PatternBar patternBar;
     StepGrid grid;
+    StepEditor stepEditor;
+    LivePanel livePanel;
 
     std::vector<double> tapTimes;
+    int blink = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlitchNastyEditor)
 };

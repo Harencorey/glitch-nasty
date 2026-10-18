@@ -8,6 +8,9 @@
 // those samples - like a drum machine firing its trigger on the exact tick
 // rather than the next time it happens to check.
 //
+// Swing pushes every second grid line late (MPC-style): with swing s (0..0.5
+// of a step), the first step of each pair is longer and the second shorter.
+//
 // It also notices when the position jumps (DAW loop/cycle, locating, starting
 // playback). Then it resyncs and waits for the next grid line instead of
 // firing a half-step.
@@ -34,23 +37,34 @@ public:
 
     void reset() noexcept { synced = false; }
 
+    // Where step k starts, measured in steps (odd steps pushed late by the swing).
+    static double stepStart (int64_t k, double swing) noexcept
+    {
+        return (double) k + ((k & 1) != 0 ? swing : 0.0);
+    }
+
     // Finds every grid line inside [ppqStart, ppqStart + numSamples).
     // 'resynced' is set when the position jumped or playback just started.
-    int process (double ppqStart, double samplesPerQuarter, double stepPpq,
+    int process (double ppqStart, double samplesPerQuarter, double stepPpq, double swing,
                  int numSamples, GridEvent* out, bool& resynced) noexcept
     {
         resynced = false;
+        swing = std::clamp (swing, 0.0, 0.5);
         const double samplesPerStep = samplesPerQuarter * stepPpq;
-        const double s0 = ppqStart / stepPpq; // position, in steps
-        constexpr double tolSamples = 1.0e-3; // treat lines within 1/1000 sample as "now"
+        const double s0 = ppqStart / stepPpq;                 // position, in steps
+        constexpr double tolSamples = 1.0e-3;                 // lines within 1/1000 sample count as "now"
+        const double tol = tolSamples / samplesPerStep;
 
         const bool jumped = std::abs (ppqStart - expectedPpq) * samplesPerQuarter > kJumpToleranceSamples;
 
         if (! synced || std::abs (stepPpq - lastStepPpq) > 1.0e-12 || jumped)
         {
             // The step we're inside counts as already started (no half-steps),
-            // unless we're sitting exactly on a grid line.
-            lastStep = (int64_t) std::ceil (s0 - tolSamples / samplesPerStep) - 1;
+            // unless we're sitting exactly on its grid line.
+            auto k0 = (int64_t) std::floor (s0 + tol);
+            if (stepStart (k0, swing) > s0 + tol)
+                --k0; // we're in the late-pushed gap of a swung pair
+            lastStep = (std::abs (stepStart (k0, swing) - s0) <= tol) ? k0 - 1 : k0;
             synced = true;
             resynced = true;
         }
@@ -61,12 +75,12 @@ public:
         int count = 0;
         for (int64_t k = lastStep + 1; count < kMaxEvents; ++k)
         {
-            const double offsetSamples = ((double) k - s0) * samplesPerStep;
+            const double offsetSamples = (stepStart (k, swing) - s0) * samplesPerStep;
             int n = (int) std::ceil (offsetSamples - tolSamples);
             if (n >= numSamples)
                 break;
             if (n < 0)
-                n = 0; // host nudged us slightly past the line: fire immediately
+                n = 0; // host nudged us slightly past the line (or the swing moved it): fire now
 
             out[count++] = { n, k, std::clamp ((double) n - offsetSamples, 0.0, 1.0) };
             lastStep = k;

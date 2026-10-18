@@ -3,8 +3,8 @@
 //
 // The main trick: feed in a "counter" signal where every sample's value is its
 // own sample number (0, 1, 2, 3 ...). Then every output sample tells us exactly
-// which input sample it came from, so we can check the loop points land on the
-// grid to within one sample.
+// which input sample it came from, so we can check loop points land on the
+// grid to within one sample, and that nothing ever plays audio from the future.
 //
 // Build & run:  cmake --build build --target GlitchNastyTests && ./build/GlitchNastyTests
 //==============================================================================
@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <new>
 #include <random>
 #include <vector>
@@ -42,6 +43,11 @@ static int gFailures = 0;
         if (! (cond)) { ++gFailures; std::printf ("  FAIL: " __VA_ARGS__); std::printf ("\n"); } \
     } while (0)
 
+using T = gn::StutterType;
+using Buffers = std::vector<std::vector<float>>;
+
+struct AbsMidi { size_t pos; uint8_t status, d1, d2; };
+
 struct RunConfig
 {
     double sampleRate = 48000.0;
@@ -50,19 +56,18 @@ struct RunConfig
     bool useHost = true;
     int channels = 2;
     int fixedBlock = 0;   // 0 = random block sizes 1..1024
-    uint32_t seed = 1;
+    std::vector<AbsMidi> midi;
 };
 
-// Runs the core over 'input' (mono, copied to every channel). Returns channel 0.
-static std::vector<float> run (const std::vector<float>& input, const gn::CoreParams& params,
-                               const RunConfig& cfg, std::vector<double>* ppqOverride = nullptr)
+// Runs the core over 'input' (mono, copied to every channel). Returns every channel.
+static Buffers runAll (const std::vector<float>& input, const gn::CoreParams& params, const gn::PatternBank& bank,
+                       const RunConfig& cfg, const std::vector<double>* ppqOverride = nullptr)
 {
     gn::GlitchCore core;
     core.prepare (cfg.sampleRate, cfg.channels);
-    core.setRandomSeed (cfg.seed);
 
-    std::vector<std::vector<float>> bufs ((size_t) cfg.channels, std::vector<float> (input.size()));
-    for (auto& b : bufs) b = input;
+    Buffers bufs ((size_t) cfg.channels, input);
+    std::vector<gn::MidiEvent> midiBlock (cfg.midi.size() + 1);
 
     std::mt19937 rng (1234);
     std::uniform_int_distribution<int> blockDist (1, 1024);
@@ -82,14 +87,25 @@ static std::vector<float> run (const std::vector<float>& input, const gn::CorePa
         ht.bpm = cfg.bpm;
         ht.ppq = ppqOverride ? (*ppqOverride)[pos] : (double) pos / spq;
 
+        int nm = 0;
+        for (const auto& m : cfg.midi)
+            if (m.pos >= pos && m.pos < pos + (size_t) n)
+                midiBlock[(size_t) nm++] = { (int) (m.pos - pos), m.status, m.d1, m.d2 };
+
         for (int c = 0; c < cfg.channels; ++c)
             ptrs[c] = bufs[(size_t) c].data() + pos;
 
-        core.process (ptrs, cfg.channels, n, params, ht);
+        core.process (ptrs, cfg.channels, n, params, ht, bank, midiBlock.data(), nm, -1);
         pos += (size_t) n;
     }
     gWatchAllocs = false;
-    return bufs[0];
+    return bufs;
+}
+
+static std::vector<float> run (const std::vector<float>& input, const gn::CoreParams& params, const gn::PatternBank& bank,
+                               const RunConfig& cfg = {}, const std::vector<double>* ppqOverride = nullptr)
+{
+    return runAll (input, params, bank, cfg, ppqOverride)[0];
 }
 
 static std::vector<float> counterSignal (size_t n)
@@ -99,19 +115,63 @@ static std::vector<float> counterSignal (size_t n)
     return v;
 }
 
+static std::vector<float> sineSignal (size_t n, double hz, double sr = 48000.0)
+{
+    std::vector<float> v (n);
+    for (size_t i = 0; i < n; ++i) v[i] = (float) std::sin (2.0 * M_PI * hz * (double) i / sr);
+    return v;
+}
+
+static gn::PatternBank bankWith (const std::function<void (gn::Pattern&)>& fill)
+{
+    gn::PatternBank b;
+    fill (b.patterns[0]);
+    return b;
+}
+
+static gn::PatternBank allSteps (T type, int division, float p1 = -1.0f, float p2 = -1.0f)
+{
+    return bankWith ([&] (gn::Pattern& pat)
+    {
+        for (auto& s : pat)
+        {
+            s = gn::makeStep (type, division);
+            if (p1 >= 0.0f) s.p1 = p1;
+            if (p2 >= 0.0f) s.p2 = p2;
+        }
+    });
+}
+
+static double maxJump (const std::vector<float>& v, size_t from = 1)
+{
+    double m = 0.0;
+    for (size_t n = std::max<size_t> (from, 1); n < v.size(); ++n) m = std::max (m, (double) std::abs (v[n] - v[n - 1]));
+    return m;
+}
+
+static double rms (const std::vector<float>& v, size_t a, size_t b)
+{
+    double s = 0.0;
+    for (size_t n = a; n < b; ++n) s += (double) v[n] * v[n];
+    return std::sqrt (s / (double) (b - a));
+}
+
 //------------------------------------------------------------------------------
-// 1) Loop points and step boundaries land on the true grid (within 1 sample).
-static void testGridAccuracy (double sr, double bpm, int grid, int division, const char* label)
+// 1) Loop points and step boundaries land on the true (swung) grid, within 1 sample.
+static void testGridAccuracy (double sr, double bpm, int grid, int division, double swingPct, const char* label)
 {
     std::printf ("Grid accuracy: %s\n", label);
 
     gn::CoreParams p;
     p.gridIndex = grid;
-    p.numSteps = 16;
     p.crossfadeMs = 0.0f; // hard cuts so jumps are visible
+    p.swing = (float) swingPct;
     const bool pattern[16] = { 1,0,1,1, 0,0,1,0, 1,1,1,0, 0,1,0,1 };
-    for (int i = 0; i < 16; ++i)
-        p.steps[(size_t) i] = { pattern[i], 1.0f, division };
+    const auto bank = bankWith ([&] (gn::Pattern& pat)
+    {
+        for (int i = 0; i < 16; ++i)
+            if (pattern[i]) pat[(size_t) i] = gn::makeStep (T::repeat, division);
+    });
 
     RunConfig cfg;
     cfg.sampleRate = sr;
@@ -120,31 +180,31 @@ static void testGridAccuracy (double sr, double bpm, int grid, int division, con
     const double spq = sr * 60.0 / bpm;
     const double stepLen = spq * gn::kGridPpq[grid];
     const double slice = spq * gn::kDivisionPpq[division];
+    const double sw = (swingPct - 0.5) * 2.0;
     const int totalSteps = 48;
     const size_t total = (size_t) std::ceil (stepLen * totalSteps);
 
     gAllocCount = 0;
-    const auto out = run (counterSignal (total), p, cfg);
+    const auto out = run (counterSignal (total), p, bank, cfg);
     CHECK (gAllocCount == 0, "%d heap allocations on the audio path", gAllocCount.load());
 
-    // Where the output jumps (source sample isn't previous + 1).
     std::vector<size_t> found;
     for (size_t n = 1; n < out.size(); ++n)
         if ((int64_t) out[n] != (int64_t) out[n - 1] + 1)
             found.push_back (n);
 
-    // Where it should jump, from the ideal (real-valued) grid.
     struct Jump { double t; double src; bool live; };
     std::vector<Jump> ideal;
     for (int k = 0; k < totalSteps; ++k)
     {
         if (! pattern[k % 16]) continue;
-        const double t0 = k * stepLen, t1 = (k + 1) * stepLen;
+        const double t0 = gn::GridScheduler::stepStart (k, sw) * stepLen;
+        const double t1 = gn::GridScheduler::stepStart (k + 1, sw) * stepLen;
         int wraps = 0;
         for (int j = 1; t0 + j * slice < t1 - 0.5; ++j, ++wraps)
             ideal.push_back ({ t0 + j * slice, t0, false });
         if (wraps > 0 && t1 < (double) total - 1)
-            ideal.push_back ({ t1, t1, true }); // back to live (or a fresh slice) at the step end
+            ideal.push_back ({ t1, t1, true });
     }
 
     CHECK (found.size() == ideal.size(), "found %zu jumps, expected %zu", found.size(), ideal.size());
@@ -161,60 +221,19 @@ static void testGridAccuracy (double sr, double bpm, int grid, int division, con
     std::printf ("  %zu loop/return points, worst timing error %.2f samples\n", found.size(), worst);
 }
 
-// 2) Output doesn't depend on how the host chops up the blocks.
-static void testBlockSizeIndependence()
+//------------------------------------------------------------------------------
+// 2) Every original type with its default controls plays the right samples.
+static void testTypeDefaults()
 {
-    std::printf ("Block-size independence\n");
-    gn::CoreParams p;
-    for (int i = 0; i < 16; ++i)
-        p.steps[(size_t) i] = { (i % 3) != 1, 1.0f, (i * 3) % gn::kNumDivisions, i % gn::kNumStutterTypes };
-    p.gridIndex = 5; // 1/16T
-
-    RunConfig a; a.sampleRate = 44100.0; a.bpm = 137.0;
-    RunConfig b = a; b.fixedBlock = 1;
-    RunConfig c = a; c.fixedBlock = 4096;
-
-    std::vector<float> in (44100 * 6);
-    for (size_t n = 0; n < in.size(); ++n) in[n] = (float) std::sin (0.031 * (double) n) * 0.5f;
-
-    const auto oa = run (in, p, a), ob = run (in, p, b), oc = run (in, p, c);
-    double maxDiff = 0.0;
-    for (size_t n = 0; n < in.size(); ++n)
-        maxDiff = std::max ({ maxDiff, (double) std::abs (oa[n] - ob[n]), (double) std::abs (oa[n] - oc[n]) });
-    CHECK (maxDiff == 0.0, "outputs differ by %g between block sizes", maxDiff);
-    std::printf ("  random vs 1-sample vs 4096-sample blocks: max difference %g\n", maxDiff);
-}
-
-// 3) Crossfades remove the clicks at loop points.
-static double maxJump (const std::vector<float>& v)
-{
-    double m = 0.0;
-    for (size_t n = 1; n < v.size(); ++n) m = std::max (m, (double) std::abs (v[n] - v[n - 1]));
-    return m;
-}
-
-// 3b) Every stutter type does what it says (counter input decodes the playback position).
-static std::vector<float> runAllSteps (gn::StutterType type, int grid, int division,
-                                       const std::vector<float>& in, float xfadeMs = 0.0f)
-{
-    gn::CoreParams p;
-    p.gridIndex = grid;
-    p.crossfadeMs = xfadeMs;
-    for (auto& s : p.steps) s = { true, 1.0f, division, (int) type };
-    return run (in, p, RunConfig {});
-}
-
-static void testTypes()
-{
-    using T = gn::StutterType;
-    std::printf ("Stutter types (48k, 120 BPM)\n");
+    std::printf ("Stutter types, default controls (48k, 120 BPM)\n");
     const auto counter = counterSignal (48000 * 4);
-    const int G16 = 2, G4 = 0, D16 = 5, D32 = 7;
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
 
-    // Max |output - expected| over the repeats of every 1/16 step (6000 samples, slice 3000).
     auto check16 = [&] (const char* name, T type, auto expectedOffset)
     {
-        const auto out = runAllSteps (type, G16, D32, counter);
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (type, gn::kDiv32));
         double worst = 0.0;
         for (size_t n = 6000; n + 1 < out.size(); ++n)
         {
@@ -225,13 +244,14 @@ static void testTypes()
         CHECK (worst < 0.1, "%s: playback off by %.2f samples", name, worst);
         std::printf ("  %-10s plays the right samples (worst error %.3f)\n", name, worst);
     };
-    check16 ("Reverse",   T::reverse,   [] (double r) { return 2999.0 - r; });
-    check16 ("Pitch +12", T::pitchUp,   [] (double r) { return 2.0 * std::fmod (r, 1500.0); });
-    check16 ("Pitch -12", T::pitchDown, [] (double r) { return 0.5 * r; });
+    check16 ("Repeat",    T::repeat,  [] (double r) { return r; });
+    check16 ("Reverse",   T::reverse, [] (double r) { return 2999.0 - r; });
+    check16 ("Pitch +12", T::pitch,   [] (double r) { return 2.0 * std::fmod (r, 1500.0); });
 
-    // Roll on a 1/4 grid from 1/16: 6000 live, then repeats of 3000, 1500, 750, 750 ... (1/128 floor)
+    // Roll on a 1/4 grid from 1/16: 6000 live, then 3000, 1500, 750, 750 ... (1/128 floor)
     {
-        const auto out = runAllSteps (T::roll, G4, D16, counter);
+        p.gridIndex = 0;
+        const auto out = run (counter, p, allSteps (T::roll, gn::kDiv16));
         double worst = 0.0;
         for (size_t n = 24000; n < out.size(); ++n)
         {
@@ -248,187 +268,628 @@ static void testTypes()
         std::printf ("  %-10s halves each repeat down to 1/128 (worst error %.3f)\n", "Roll", worst);
     }
 
-    // Tape Stop over a whole 1/16 step: position = integral of a speed falling 1 -> 0.
+    // Tape Stop over a whole 1/16 step.
     {
-        const auto out = runAllSteps (T::tapeStop, G16, D16, counter);
-        double worst = 0.0, tail = 0.0;
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (T::tapeStop, gn::kDiv16));
+        double worst = 0.0;
         for (size_t n = 6000; n < out.size(); ++n)
         {
             const double S = (double) (n / 6000 * 6000), e = (double) n - S;
             const double pos = S + e - e * (e - 1.0) / (2.0 * 6000.0);
-            const double rate = 1.0 - e / 6000.0;
-            const double gain = std::min (1.0, rate * 4.0);
-            if (e < 4400) worst = std::max (worst, std::abs ((double) out[n] - pos));
-            else          tail = std::max (tail, std::abs ((double) out[n] - pos * gain));
+            const double gain = std::min (1.0, (1.0 - e / 6000.0) * 4.0);
+            worst = std::max (worst, std::abs ((double) out[n] - pos * gain));
         }
-        CHECK (worst < 0.1 && tail < 0.1, "Tape Stop: off by %.3f / %.3f", worst, tail);
-        std::printf ("  %-10s decelerates to a stop (worst error %.3f)\n", "Tape Stop", std::max (worst, tail));
+        CHECK (worst < 0.1, "Tape Stop: off by %.3f", worst);
+        std::printf ("  %-10s decelerates to a stop (worst error %.3f)\n", "Tape Stop", worst);
     }
 
-    // Gate: open for the first half of every 1/32, silent for the second half.
+    // Gate (50 % duty, hard): open first half of every 1/32.
     {
-        std::vector<float> sine (48000 * 2);
-        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (0.05 * (double) n);
-        const auto out = runAllSteps (T::gate, G16, D32, sine);
+        p.gridIndex = 2;
+        const auto sine = sineSignal (48000 * 2, 382.0);
+        const auto out = run (sine, p, allSteps (T::gate, gn::kDiv32));
         double worst = 0.0;
         for (size_t n = 0; n < out.size(); ++n)
-        {
-            const bool open = (n % 3000) < 1500;
-            worst = std::max (worst, (double) std::abs (out[n] - (open ? sine[n] : 0.0f)));
-        }
+            worst = std::max (worst, (double) std::abs (out[n] - ((n % 3000) < 1500 ? sine[n] : 0.0f)));
         CHECK (worst < 1.0e-6, "Gate: off by %g", worst);
-        std::printf ("  %-10s open/closed exactly on the 1/64 grid\n", "Gate");
+        std::printf ("  %-10s open/closed exactly on the grid\n", "Gate");
     }
 
     // Fade: each repeat 0.6x the one before.
     {
-        std::vector<float> sine (48000 * 2);
-        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (2.0 * M_PI * 1000.0 * (double) n / 48000.0);
-        const auto out = runAllSteps (T::fade, G4, D16, sine);
-        auto rms = [&] (size_t a, size_t b) { double s = 0; for (size_t n = a; n < b; ++n) s += (double) out[n] * out[n]; return std::sqrt (s / (double) (b - a)); };
-        const double r0 = rms (24000, 30000), r1 = rms (30000, 36000), r2 = rms (36000, 42000), r3 = rms (42000, 48000);
+        p.gridIndex = 0;
+        const auto out = run (sineSignal (48000 * 2, 1000.0), p, allSteps (T::fade, gn::kDiv16));
+        const double r0 = rms (out, 24000, 30000), r1 = rms (out, 30000, 36000), r2 = rms (out, 36000, 42000), r3 = rms (out, 42000, 48000);
         const bool ok = std::abs (r1 / r0 - 0.6) < 0.01 && std::abs (r2 / r0 - 0.36) < 0.01 && std::abs (r3 / r0 - 0.216) < 0.01;
         CHECK (ok, "Fade levels %.3f %.3f %.3f", r1 / r0, r2 / r0, r3 / r0);
         std::printf ("  %-10s repeats at %.2f, %.2f, %.2f of the first pass\n", "Fade", r1 / r0, r2 / r0, r3 / r0);
     }
+}
 
-    // No clicks: with the default 3 ms crossfade every type stays smooth on a sine.
+//------------------------------------------------------------------------------
+// 3) The type-specific controls.
+static void testTypeControls()
+{
+    std::printf ("Type controls\n");
+    const auto counter = counterSignal (48000 * 3);
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+
+    // Repeat Offset: 1/8 steps, 1/32 slices (4 per step), offset slice 2 -> live for half the step, then loop slice 2.
     {
-        std::vector<float> sine (48000 * 3);
-        for (size_t n = 0; n < sine.size(); ++n) sine[n] = (float) std::sin (2.0 * M_PI * 440.0 * (double) n / 48000.0);
+        p.gridIndex = 1;
+        const auto out = run (counter, p, allSteps (T::repeat, gn::kDiv32, 1.0f / 3.0f));
+        bool ok = true;
+        for (size_t n = 12000; n < 24000; ++n)
+        {
+            const size_t e = n - 12000;
+            const double expect = e < 6000 ? (double) n : 15000.0 + (double) ((e - 6000) % 3000);
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "Repeat Offset loops the wrong slice");
+        std::printf ("  Repeat Offset loops the chosen slice of the step\n");
+    }
+
+    // Repeat Variation: repeats start up to 1/4 slice early, never late.
+    {
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (T::repeat, gn::kDiv64, 0.0f, 1.0f)); // 1500-sample slices
+        bool ok = true, varied = false;
+        for (size_t step = 1; step < 20; ++step)
+            for (size_t r = 1; r < 4; ++r)
+            {
+                const size_t n = step * 6000 + r * 1500;
+                const double start = (double) out[n], S = (double) step * 6000.0;
+                ok &= start <= S + 0.01 && start >= S - 375.0 - 0.01;
+                varied |= start < S - 1.0;
+            }
+        CHECK (ok && varied, "Repeat Variation out of range (ok=%d varied=%d)", (int) ok, (int) varied);
+        std::printf ("  Repeat Variation nudges each repeat up to 1/4 slice earlier\n");
+    }
+
+    // Reverse ping-pong: backwards, forwards, backwards ...
+    {
+        p.gridIndex = 0;
+        const auto out = run (counter, p, allSteps (T::reverse, gn::kDiv16, 1.0f));
+        bool ok = true;
+        for (size_t n = 24000; n < 48000; ++n)
+        {
+            const double e = (double) (n - 24000);
+            const int k = (int) (e / 6000.0);
+            const double u = e - k * 6000.0;
+            const double expect = k == 0 ? (double) n : (k % 2 == 1 ? 24000.0 + 5999.0 - u : 24000.0 + u);
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "Reverse ping-pong");
+        std::printf ("  Reverse Ping-Pong alternates backwards and forwards\n");
+    }
+
+    // Gate 25 % duty.
+    {
+        p.gridIndex = 2;
+        const auto sine = sineSignal (48000, 382.0);
+        const auto out = run (sine, p, allSteps (T::gate, gn::kDiv32, (0.25f - 0.05f) / 0.9f));
+        double worst = 0.0;
+        for (size_t n = 0; n < out.size(); ++n)
+            if (n % 3000 != 750) // the edge sample itself sits on a float rounding boundary
+                worst = std::max (worst, (double) std::abs (out[n] - ((n % 3000) < 750 ? sine[n] : 0.0f)));
+        CHECK (worst < 1.0e-5, "Gate duty 25%%: off by %g", worst);
+        std::printf ("  Gate Duty 25%% opens for exactly a quarter of each cycle\n");
+    }
+
+    // Gate Pump: ducks at each cycle start, swells back by the duty point.
+    {
+        p.gridIndex = 2;
+        p.crossfadeMs = 3.0f;
+        const auto ones = std::vector<float> (48000, 1.0f);
+        const auto out = run (ones, p, allSteps (T::gate, gn::kDiv32, 0.5f, 1.0f));
+        p.crossfadeMs = 0.0f;
+        const double atStart = out[6000 + 3000 + 200], atQuarter = out[6000 + 3000 + 750], atHalf = out[6000 + 3000 + 1600];
+        const bool ok = atStart < 0.05 && std::abs (atQuarter - 0.25) < 0.02 && atHalf > 0.99;
+        CHECK (ok, "Gate pump curve %.3f %.3f %.3f", atStart, atQuarter, atHalf);
+        std::printf ("  Gate Pump: %.2f just after the beat, %.2f a quarter in, %.2f by the duty point\n", atStart, atQuarter, atHalf);
+    }
+
+    // Roll slow down, curve 0 (factor 0.9): each repeat 1/0.9 longer.
+    {
+        p.gridIndex = 0;
+        const auto out = run (counter, p, allSteps (T::roll, gn::kDiv64, 1.0f, 0.0f)); // 1500-sample slices
+        std::vector<double> expectWraps;
+        double t = 1500.0, len = 1500.0;
+        while (t < 24000.0 - 0.5) { expectWraps.push_back (t); len /= 0.9; t += len; }
+        std::vector<size_t> found;
+        for (size_t n = 24001; n < 48000; ++n)
+            if ((int64_t) out[n] != (int64_t) out[n - 1] + 1) found.push_back (n - 24000);
+        bool ok = found.size() == expectWraps.size();
+        for (size_t i = 0; ok && i < found.size(); ++i) ok &= std::abs ((double) found[i] - expectWraps[i]) <= 1.0;
+        CHECK (ok, "Roll slow-down: %zu wraps, expected %zu", found.size(), expectWraps.size());
+        std::printf ("  Roll Slow Down: each repeat 1/0.9 longer (%zu repeats, on time)\n", found.size());
+    }
+
+    // Pitch +7 semitones (any interval, not just octaves).
+    {
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (T::pitch, gn::kDiv32, 0.5f + 7.0f / 48.0f, 0.5f));
+        const double r = std::exp2 (7.0 / 12.0);
+        double worst = 0.0, pos = 6000.0;
+        for (size_t n = 9000; n < 12000; ++n)
+        {
+            if (n > 9000) { pos += r; if (pos >= 9000.0) pos -= 3000.0; }
+            worst = std::max (worst, std::abs ((double) out[n] - pos));
+        }
+        CHECK (worst < 0.05, "Pitch +7: off by %.3f", worst);
+        std::printf ("  Pitch +7 st plays at exactly 2^(7/12) speed (worst error %.3f)\n", worst);
+    }
+
+    // Pitch glide +12 across a 1/4 step from 0 st: speed = 2^(t / step).
+    {
+        p.gridIndex = 0;
+        const auto out = run (counter, p, allSteps (T::pitch, gn::kDiv16, 0.5f, 0.75f));
+        double worst = 0.0;
+        for (double e : { 6100.0, 12010.0, 18020.0 })
+        {
+            const size_t n = 24000 + (size_t) e;
+            worst = std::max (worst, std::abs ((double) (out[n + 1] - out[n]) - std::exp2 (e / 24000.0)));
+        }
+        CHECK (worst < 0.01, "Pitch glide speed off by %.4f", worst);
+        std::printf ("  Pitch Glide bends smoothly across the step (speed error %.4f)\n", worst);
+    }
+
+    // Tape Start: spins up from a standstill (position = integral of t/len).
+    {
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (T::tapeStop, gn::kDiv16, 1.0f, 0.0f));
+        double worst = 0.0;
+        for (size_t n = 6000; n < 12000; ++n)
+        {
+            const double e = (double) (n - 6000);
+            const double pos = 6000.0 + e * (e - 1.0) / (2.0 * 6000.0);
+            const double gain = std::min (1.0, (e / 6000.0) * 4.0);
+            worst = std::max (worst, std::abs ((double) out[n] - pos * gain));
+        }
+        CHECK (worst < 0.1, "Tape Start: off by %.3f", worst);
+        std::printf ("  Tape Start spins up from nothing (worst error %.3f)\n", worst);
+    }
+
+    // Fade In: each repeat louder, ending at full level.
+    {
+        p.gridIndex = 0;
+        const auto out = run (sineSignal (48000 * 2, 1000.0), p, allSteps (T::fade, gn::kDiv16, 3.0f / 7.0f, 1.0f));
+        const double r0 = rms (out, 24000, 30000), r3 = rms (out, 42000, 48000), in = 1.0 / std::sqrt (2.0);
+        const bool ok = std::abs (r0 / in - 0.216) < 0.01 && std::abs (r3 / in - 1.0) < 0.01;
+        CHECK (ok, "Fade In levels %.3f -> %.3f", r0 / in, r3 / in);
+        std::printf ("  Fade In swells %.2f -> %.2f\n", r0 / in, r3 / in);
+    }
+}
+
+//------------------------------------------------------------------------------
+// 4) The new types.
+static void testNewTypes()
+{
+    std::printf ("New types\n");
+    const auto counter = counterSignal (48000 * 3);
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+
+    // Shuffle: every slice is either live or an earlier, slice-aligned slice (maybe reversed).
+    {
+        p.gridIndex = 0; // 1/4 steps, 1/16 slices: 4 per step
+        const auto out = run (counter, p, allSteps (T::shuffle, gn::kDiv16, 1.0f, 0.5f));
+        bool ok = true;
+        int swapped = 0, reversed = 0;
+        for (size_t step = 1; step < 5; ++step)
+            for (int k = 1; k < 4; ++k)
+            {
+                const double S = (double) step * 24000.0, base = S + k * 6000.0;
+                const double first = out[(size_t) base], second = out[(size_t) base + 1];
+                if (first == base) continue; // live
+                ++swapped;
+                const bool rev = second < first;
+                reversed += rev ? 1 : 0;
+                const double sliceStart = rev ? first - 5999.0 : first;
+                const double j = (sliceStart - S) / 6000.0;
+                ok &= std::abs (j - std::round (j)) < 1.0e-6 && j < k && j >= k - 3;
+            }
+        CHECK (ok && swapped > 3, "Shuffle slices wrong (ok=%d swapped=%d)", (int) ok, swapped);
+        std::printf ("  Shuffle: %d of 12 slices swapped for earlier ones (%d reversed), all on the slice grid\n", swapped, reversed);
+    }
+
+    // Freeze: smooth, never silent, never the future.
+    {
+        p.gridIndex = 0;
+        p.crossfadeMs = 3.0f;
+        const auto sine = sineSignal (48000 * 2, 440.0);
+        const auto out = run (sine, p, allSteps (T::freeze, gn::kDiv16));
+        p.crossfadeMs = 0.0f;
+        const double level = rms (out, 26000, 46000), jump = maxJump (out, 24000);
+        CHECK (level > 0.2 && jump < 0.09, "Freeze level %.3f, biggest step %.3f", level, jump);
+        std::printf ("  Freeze holds a drone (level %.2f, biggest sample step %.3f)\n", level, jump);
+    }
+
+    // Scratch: swings between S - depth and S.
+    {
+        p.gridIndex = 2;
+        const auto out = run (counter, p, allSteps (T::scratch, gn::kDiv32));
+        const double A = gn::scratchDepth (0.5f) * 3000.0;
+        bool ok = true;
+        double lo = 1e9;
+        for (size_t n = 6000; n < 12000; ++n)
+        {
+            ok &= out[n] <= 6000.0f + 0.01f && out[n] >= 6000.0 - A - 0.01;
+            lo = std::min (lo, (double) out[n]);
+        }
+        CHECK (ok && lo < 6000.0 - A + 1.0, "Scratch range");
+        std::printf ("  Scratch drags back %.0f samples and returns, never past 'now'\n", 6000.0 - lo);
+    }
+
+    // Ping-Pong: repeats alternate hard left / hard right.
+    {
+        p.gridIndex = 0;
+        const auto both = runAll (sineSignal (48000, 1000.0), p, allSteps (T::pingPong, gn::kDiv16), RunConfig {});
+        const double l1 = rms (both[0], 30000, 36000), r1 = rms (both[1], 30000, 36000);
+        const double l2 = rms (both[0], 36000, 42000), r2 = rms (both[1], 36000, 42000);
+        const bool ok = l1 > 0.7 && r1 < 1.0e-6 && l2 < 1.0e-6 && r2 > 0.7;
+        CHECK (ok, "Ping-pong L/R %.3f/%.3f then %.3f/%.3f", l1, r1, l2, r2);
+        std::printf ("  Ping-Pong: repeat 1 left only, repeat 2 right only\n");
+    }
+}
+
+//------------------------------------------------------------------------------
+// 5) Per-step level / pan / filter, ties.
+static void testStepShaping()
+{
+    std::printf ("Level, pan, filter, ties\n");
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+
+    // Level -6 dB, pan +0.5 (balance law: left drops to half, right unchanged).
+    {
+        auto bank = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : bank.patterns[0]) { s.levelDb = -6.0f; s.pan = 0.5f; }
+        const auto in = sineSignal (24000, 300.0);
+        const auto both = runAll (in, p, bank, RunConfig {});
+        const float g = std::pow (10.0f, -6.0f / 20.0f);
+        double worst = 0.0;
+        for (size_t n = 6000; n < 9000; ++n)
+            worst = std::max ({ worst, (double) std::abs (both[0][n] - in[n] * g * 0.5f), (double) std::abs (both[1][n] - in[n] * g) });
+        CHECK (worst < 1.0e-6, "Level/pan off by %g", worst);
+        std::printf ("  Level -6 dB + Pan R50 exact on both sides\n");
+    }
+
+    // Filter: LP (-0.8, ~500 Hz) kills a 5 kHz tone; HP (+0.8, ~1.4 kHz) kills 100 Hz.
+    {
+        auto lp = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : lp.patterns[0]) s.filter = -0.8f;
+        const auto hiTone = sineSignal (48000, 5000.0);
+        const double lpRatio = rms (run (hiTone, p, lp), 24000, 48000) / rms (hiTone, 24000, 48000);
+
+        auto hp = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : hp.patterns[0]) s.filter = 0.8f;
+        const auto loTone = sineSignal (48000, 100.0);
+        const double hpRatio = rms (run (loTone, p, hp), 24000, 48000) / rms (loTone, 24000, 48000);
+
+        CHECK (lpRatio < 0.08 && hpRatio < 0.12, "Filter ratios LP %.3f HP %.3f", lpRatio, hpRatio);
+        std::printf ("  Filter: LP leaves %.1f%% of 5 kHz, HP leaves %.1f%% of 100 Hz\n", lpRatio * 100.0, hpRatio * 100.0);
+
+        // After the filtered glitch ends, the dry signal comes back bit-identical.
+        auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            for (int i = 0; i < 4; ++i) { pat[(size_t) i] = gn::makeStep (T::repeat, gn::kDiv32); pat[(size_t) i].filter = -0.5f; }
+        });
+        const auto noise = sineSignal (96000, 777.0);
+        const auto out = run (noise, p, bank);
+        bool identical = true;
+        for (size_t n = 30000; n < 96000; ++n) identical &= out[n] == noise[n];
+        CHECK (identical, "dry signal not restored after a filtered glitch");
+        std::printf ("  ... and the dry signal is bit-identical again once the glitch ends\n");
+    }
+
+    // Ties: step 1 = Repeat 1/32 for 4 steps; steps 2-4 (Reverse) are ignored.
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat[0] = gn::makeStep (T::repeat, gn::kDiv32, 1.0f, 4);
+            for (int i = 1; i < 4; ++i) pat[(size_t) i] = gn::makeStep (T::reverse, gn::kDiv16);
+        });
+        const auto out = run (counterSignal (120000), p, bank);
+        bool ok = true;
+        for (size_t n = 0; n < 120000; ++n)
+        {
+            const size_t bar = n / 96000 * 96000, e = n - bar;
+            const double expect = (e >= 3000 && e < 24000) ? (double) (bar + e % 3000) : (double) n;
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "Ties");
+        std::printf ("  Ties: one glitch runs across 4 steps; the covered steps stay silent\n");
+    }
+}
+
+//------------------------------------------------------------------------------
+// 6) Density, seed, chance.
+static void testRandomness()
+{
+    std::printf ("Chance, density, seed\n");
+
+    // Chance distribution (internal clock, 1 block = 1 step).
+    {
+        gn::CoreParams p;
+        p.syncMode = 1;
+        p.seed = 99;
+        const int stepLen = 6000;
+        auto countFires = [&] (float prob, int steps)
+        {
+            gn::PatternBank bank;
+            for (auto& s : bank.patterns[0]) s = gn::makeStep (T::repeat, gn::kDiv32, prob);
+            gn::GlitchCore core;
+            core.prepare (48000.0, 1);
+            std::vector<float> buf ((size_t) stepLen, 0.0f);
+            float* ptr = buf.data();
+            int fires = 0;
+            for (int i = 0; i < steps; ++i)
+            {
+                core.process (&ptr, 1, stepLen, p, gn::HostTime {}, bank);
+                if (core.getFiringStep() >= 0) ++fires;
+            }
+            return fires;
+        };
+        const int n = 4000;
+        const int f0 = countFires (0.0f, n), f50 = countFires (0.5f, n), f100 = countFires (1.0f, n);
+        std::printf ("  chance 0%%: %d/%d   50%%: %d/%d   100%%: %d/%d\n", f0, n, f50, n, f100, n);
+        CHECK (f0 == 0, "0%% fired %d times", f0);
+        CHECK (f100 == n, "100%% fired only %d times", f100);
+        CHECK (f50 > n * 0.45 && f50 < n * 0.55, "50%% fired %d times", f50);
+    }
+
+    const auto in = sineSignal (96000 * 2, 333.0);
+
+    // Density -100%: nothing fires. +100%: steps at 0% chance all fire.
+    {
+        gn::CoreParams p;
+        p.density = -1.0f;
+        CHECK (run (in, p, allSteps (T::repeat, gn::kDiv32)) == in, "Density -100%% still fired");
+        p.density = 1.0f;
+        auto zero = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : zero.patterns[0]) s.chance = 0.0f;
+        const auto out = run (in, p, zero);
+        int changed = 0;
+        for (size_t step = 0; step < 32; ++step) changed += out[step * 6000 + 4000] != in[step * 6000 + 4000] ? 1 : 0;
+        CHECK (changed == 32, "Density +100%%: only %d of 32 steps fired", changed);
+        std::printf ("  Density -100%% = nothing fires; +100%% = every on-step fires, even at 0%% chance\n");
+    }
+
+    // Seed: same seed, same result; different seed, different result.
+    {
+        gn::CoreParams p;
+        auto half = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : half.patterns[0]) s.chance = 0.5f;
+        p.seed = 7;
+        const auto a = run (in, p, half), b = run (in, p, half);
+        p.seed = 8;
+        const auto c = run (in, p, half);
+        CHECK (a == b && a != c, "Seed determinism");
+        std::printf ("  Seed: same seed gives the identical bounce, a new seed gives new decisions\n");
+    }
+}
+
+//------------------------------------------------------------------------------
+// 7) Live MIDI notes, quantise, pattern switching, footswitch engage.
+static void testLive()
+{
+    std::printf ("Live / MIDI\n");
+    const auto counter = counterSignal (210000);
+    gn::PatternBank empty;
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+    p.liveDivision = gn::kDiv32;
+
+    auto expectRange = [&] (const std::vector<float>& out, size_t a, size_t b, const std::function<double (size_t)>& f)
+    {
+        bool ok = true;
+        for (size_t n = a; n < b; ++n) ok &= std::abs ((double) out[n] - f (n)) < 0.01;
+        return ok;
+    };
+
+    // Unquantised: C3 held 10000..30000 -> Repeat 1/32 starting exactly at 10000.
+    {
+        p.liveQuant = 0;
+        RunConfig cfg;
+        cfg.midi = { { 10000, 0x90, 60, 100 }, { 30000, 0x80, 60, 0 } };
+        const auto out = run (counter, p, empty, cfg);
+        const bool ok = expectRange (out, 0, 13000, [] (size_t n) { return (double) n; })
+                     && expectRange (out, 13000, 30000, [] (size_t n) { return 10000.0 + (double) ((n - 10000) % 3000); })
+                     && expectRange (out, 30000, 60000, [] (size_t n) { return (double) n; });
+        CHECK (ok, "Live note, no quantise");
+        std::printf ("  Note on/off (quantise off): glitch starts and stops on the exact sample\n");
+    }
+
+    // Quantised to 1/16: note at 10000 starts at the next grid line (12000).
+    {
+        p.liveQuant = 1;
+        RunConfig cfg;
+        cfg.midi = { { 10000, 0x90, 60, 100 }, { 30000, 0x80, 60, 0 } };
+        const auto out = run (counter, p, empty, cfg);
+        const bool ok = expectRange (out, 0, 15000, [] (size_t n) { return (double) n; })
+                     && expectRange (out, 15000, 30000, [] (size_t n) { return 12000.0 + (double) ((n - 12000) % 3000); });
+        CHECK (ok, "Live note, quantise 1/16");
+        std::printf ("  Quantise 1/16: a note played between lines waits for the next one\n");
+    }
+
+    // Pattern switch: C#2 (49) selects pattern B from the next step.
+    {
+        gn::PatternBank bank;
+        for (auto& s : bank.patterns[1]) s = gn::makeStep (T::repeat, gn::kDiv32);
+        RunConfig cfg;
+        cfg.midi = { { 50000, 0x90, 49, 100 } };
+        const auto out = run (counter, p, bank, cfg);
+        const bool ok = expectRange (out, 0, 57000, [] (size_t n) { return (double) n; })
+                     && expectRange (out, 57000, 60000, [] (size_t n) { return 54000.0 + (double) (n - 57000); });
+        CHECK (ok, "MIDI pattern switch");
+        std::printf ("  MIDI C#2 switches to pattern B on the next step\n");
+    }
+
+    // Footswitch: sustain pedal toggles Engage on the next bar line.
+    {
+        const auto bank = allSteps (T::repeat, gn::kDiv32);
+        RunConfig cfg;
+        cfg.midi = { { 20000, 0xB0, 64, 127 }, { 21000, 0xB0, 64, 0 }, { 120000, 0xB0, 64, 127 }, { 121000, 0xB0, 64, 0 } };
+        const auto out = run (counter, p, bank, cfg);
+        const bool stillOn  = expectRange (out, 93000, 96000, [] (size_t n) { return 90000.0 + (double) (n - 93000); });
+        const bool off      = expectRange (out, 96000, 192000, [] (size_t n) { return (double) n; });
+        const bool backOn   = expectRange (out, 195000, 198000, [] (size_t n) { return 192000.0 + (double) (n - 195000); });
+        CHECK (stillOn && off && backOn, "Footswitch engage (%d %d %d)", (int) stillOn, (int) off, (int) backOn);
+        std::printf ("  Footswitch: off at the next bar, back on at the bar after the next press\n");
+    }
+}
+
+//------------------------------------------------------------------------------
+// 8) Safety: nothing ever reads the future; every type is click-free at 3 ms;
+//    output doesn't depend on block size; true bypasses.
+static void testSafety()
+{
+    std::printf ("Safety\n");
+
+    // Never the future, across every type and a spread of settings, with swing and ties.
+    {
+        gn::CoreParams p;
+        p.crossfadeMs = 0.0f;
+        p.swing = 0.6f;
+        const auto counter = counterSignal (60000);
+        int runs = 0, bad = 0;
+        gAllocCount = 0;
+        for (int t = 0; t < gn::kNumStutterTypes; ++t)
+            for (auto pp : { std::pair<float, float> { 0.0f, 0.0f }, { 0.37f, 1.0f }, { 1.0f, 0.5f } })
+                for (int div : { gn::kDiv16, gn::kDiv32T })
+                    for (int len : { 1, 3 })
+                    {
+                        auto bank = bankWith ([&] (gn::Pattern& pat)
+                        {
+                            for (int i = 0; i < 16; i += 2)
+                            {
+                                pat[(size_t) i] = gn::makeStep ((T) t, div, 1.0f, len);
+                                pat[(size_t) i].p1 = pp.first;
+                                pat[(size_t) i].p2 = pp.second;
+                            }
+                        });
+                        const auto out = run (counter, p, bank);
+                        ++runs;
+                        for (size_t n = 0; n < out.size(); ++n)
+                            if (! std::isfinite (out[n]) || out[n] > (float) n + 0.01f) { ++bad; break; }
+                    }
+        CHECK (bad == 0, "%d of %d runs read audio from the future", bad, runs);
+        CHECK (gAllocCount == 0, "%d heap allocations on the audio path", gAllocCount.load());
+        std::printf ("  %d runs (every type x settings x ties x swing): never plays the future, no allocations\n", runs);
+    }
+
+    // No clicks with the default 3 ms crossfade (440 Hz sine, 1/32T: never lines up with the sine).
+    {
+        gn::CoreParams p;
+        p.crossfadeMs = 3.0f;
+        const auto sine = sineSignal (48000 * 2, 440.0);
         const double clean = maxJump (sine);
         bool allSmooth = true;
-        std::printf ("  biggest sample step with 3 ms fades (input %.3f):", clean);
+        std::printf ("  biggest sample step with 3 ms fades (input %.3f):\n   ", clean);
         for (int t = 0; t < gn::kNumStutterTypes; ++t)
         {
-            const double speed = (T) t == T::pitchUp ? 2.0 : 1.0;
-            const double j = maxJump (runAllSteps ((T) t, G16, 8, sine, 3.0f)); // 1/32T: never lines up with the sine
+            const double speed = (T) t == T::pitch ? 2.0 : ((T) t == T::scratch ? 1.7 : 1.0);
+            const double j = maxJump (run (sine, p, allSteps ((T) t, gn::kDiv32T)));
             std::printf (" %s %.3f", gn::kTypeShortNames[t], j);
             if (j > clean * speed * 1.6) { allSmooth = false; std::printf ("(!)"); }
         }
         std::printf ("\n");
         CHECK (allSmooth, "a stutter type clicks with a 3 ms crossfade");
+
+        p.crossfadeMs = 0.0f;
+        const double hard = maxJump (run (sine, p, allSteps (T::repeat, gn::kDiv32T)));
+        CHECK (hard > 0.3, "expected audible clicks with no crossfade (got %.3f)", hard);
     }
-}
 
-static void testCrossfade()
-{
-    std::printf ("Crossfades (440 Hz sine, every step stuttering at 1/32T)\n");
-    gn::CoreParams p;
-    for (auto& s : p.steps) s = { true, 1.0f, 8 }; // 1/32T loops: never land on a zero crossing
-
-    RunConfig cfg;
-    std::vector<float> in (48000 * 4);
-    for (size_t n = 0; n < in.size(); ++n) in[n] = (float) std::sin (2.0 * M_PI * 440.0 * (double) n / 48000.0);
-
-    const double cleanSlope = maxJump (in);
-    p.crossfadeMs = 0.0f; const double hard = maxJump (run (in, p, cfg));
-    p.crossfadeMs = 3.0f; const double soft = maxJump (run (in, p, cfg));
-
-    std::printf ("  biggest sample-to-sample step: input %.3f, 0 ms fade %.3f, 3 ms fade %.3f\n", cleanSlope, hard, soft);
-    CHECK (hard > 0.3, "expected audible clicks with no crossfade (got %.3f)", hard);
-    CHECK (soft < cleanSlope * 2.0, "3 ms crossfade still clicks (%.3f)", soft);
-}
-
-// 4) Probability does what it says.
-static void testProbability()
-{
-    std::printf ("Probability\n");
-    gn::CoreParams p;
-    p.syncMode = 1; // internal clock
-    const double spq = 48000.0 * 60.0 / 120.0;
-    const int stepLen = (int) (spq * 0.25); // 1/16 @ 120 = 6000 samples, exact
-
-    auto countFires = [&] (float prob, int steps)
+    // Block-size independence with everything switched on.
     {
-        for (auto& s : p.steps) s = { true, prob, 7 };
-        gn::GlitchCore core;
-        core.prepare (48000.0, 1);
-        core.setRandomSeed (99);
-        std::vector<float> buf ((size_t) stepLen, 0.0f);
-        float* ptr = buf.data();
-        int fires = 0;
-        for (int i = 0; i < steps; ++i)
+        gn::CoreParams p;
+        p.swing = 0.62f;
+        p.gridIndex = 5; // 1/16T
+        p.density = 0.2f;
+        auto bank = bankWith ([] (gn::Pattern& pat)
         {
-            core.process (&ptr, 1, stepLen, p, gn::HostTime {});
-            if (core.getFiringStep() >= 0) ++fires;
-        }
-        return fires;
-    };
+            for (int i = 0; i < 16; ++i)
+            {
+                auto& s = pat[(size_t) i];
+                s = gn::makeStep ((T) (i % gn::kNumStutterTypes), (i * 3) % gn::kNumDivisions, i % 4 == 1 ? 0.5f : 1.0f, i % 5 == 0 ? 2 : 1);
+                s.on = (i % 7) != 3;
+                s.levelDb = (float) (i % 3) * -3.0f;
+                s.pan = (i % 2 == 0) ? 0.3f : -0.3f;
+                s.filter = (i % 3 == 0) ? -0.5f : ((i % 3 == 1) ? 0.4f : 0.0f);
+            }
+        });
+        std::vector<float> in (44100 * 6);
+        for (size_t n = 0; n < in.size(); ++n) in[n] = (float) std::sin (0.031 * (double) n) * 0.5f;
 
-    const int n = 4000;
-    const int f0 = countFires (0.0f, n), f50 = countFires (0.5f, n), f100 = countFires (1.0f, n);
-    std::printf ("  0%%: %d/%d   50%%: %d/%d   100%%: %d/%d\n", f0, n, f50, n, f100, n);
-    CHECK (f0 == 0, "0%% fired %d times", f0);
-    CHECK (f100 == n, "100%% fired only %d times", f100);
-    CHECK (f50 > n * 0.45 && f50 < n * 0.55, "50%% fired %d times", f50);
-}
+        RunConfig a; a.sampleRate = 44100.0; a.bpm = 137.0;
+        a.midi = { { 50000, 0x90, 62, 100 }, { 70000, 0x80, 62, 0 }, { 90000, 0x90, 50, 100 }, { 150000, 0x90, 68, 90 }, { 170000, 0x80, 68, 0 } };
+        RunConfig b = a; b.fixedBlock = 1;
+        RunConfig c = a; c.fixedBlock = 4096;
 
-// 5) Stopped transport and Mix 0 are true bypasses (bit-identical).
-static void testPassThrough()
-{
-    std::printf ("Pass-through\n");
-    gn::CoreParams p;
-    for (auto& s : p.steps) s = { true, 1.0f, 9 };
-    std::vector<float> in (48000 * 2);
-    for (size_t n = 0; n < in.size(); ++n) in[n] = (float) std::sin (0.01 * (double) n);
-
-    RunConfig stopped; stopped.hostPlaying = false;
-    CHECK (run (in, p, stopped) == in, "stopped transport changed the audio");
-
-    p.mix = 0.0f;
-    CHECK (run (in, p, RunConfig {}) == in, "Mix 0 changed the audio");
-    std::printf ("  stopped transport and Mix 0: bit-identical\n");
-}
-
-// 6) DAW cycle/loop: position jumps back, grid re-locks on the loop start.
-static void testLoopJump()
-{
-    std::printf ("DAW loop (2-bar cycle)\n");
-    gn::CoreParams p;
-    p.crossfadeMs = 0.0f;
-    for (auto& s : p.steps) s = { false, 1.0f, 7 };
-    p.steps[0] = { true, 1.0f, 7 }; // step 1: 1/32 repeats
-
-    RunConfig cfg; cfg.fixedBlock = 512;
-    const double spq = 48000.0 * 60.0 / 120.0;
-    const size_t loopLen = (size_t) (8.0 * spq);       // 2 bars = 192000 samples
-    const size_t total = loopLen * 3 + 7000;
-    std::vector<double> ppq (total);
-    for (size_t n = 0; n < total; ++n) ppq[n] = (double) (n % loopLen) / spq;
-
-    const auto out = run (counterSignal (total), p, cfg, &ppq);
-
-    const size_t slice = (size_t) (0.125 * spq); // 3000
-    bool ok = true;
-    for (size_t L = loopLen; L < total; L += loopLen)
-    {
-        // At loop start the first step fires: one slice later we should hear the loop start again.
-        if (L + slice < total && (size_t) out[L + slice] != L)
-        {
-            ok = false;
-            std::printf ("  after loop at %zu: expected source %zu, got %.0f\n", L + slice, L, (double) out[L + slice]);
-        }
+        const auto oa = run (in, p, bank, a), ob = run (in, p, bank, b), oc = run (in, p, bank, c);
+        double maxDiff = 0.0;
+        for (size_t n = 0; n < in.size(); ++n)
+            maxDiff = std::max ({ maxDiff, (double) std::abs (oa[n] - ob[n]), (double) std::abs (oa[n] - oc[n]) });
+        CHECK (maxDiff == 0.0, "outputs differ by %g between block sizes", maxDiff);
+        std::printf ("  random vs 1-sample vs 4096-sample blocks (all features + MIDI): max difference %g\n", maxDiff);
     }
-    for (size_t n = 0; n < total; ++n)
-        if (out[n] > (float) n) { ok = false; break; } // never reads the future
-    CHECK (ok, "grid didn't re-lock after the loop jump");
-    std::printf ("  re-locks on every loop start: %s\n", ok ? "yes" : "NO");
+
+    // True bypasses.
+    {
+        gn::CoreParams p;
+        const auto bank = allSteps (T::pitch, gn::kDiv64);
+        const auto in = sineSignal (48000 * 2, 123.0);
+        RunConfig stopped; stopped.hostPlaying = false;
+        CHECK (run (in, p, bank, stopped) == in, "stopped transport changed the audio");
+        p.engage = false;
+        CHECK (run (in, p, bank) == in, "Engage off changed the audio");
+        p.engage = true;
+        p.mix = 0.0f;
+        CHECK (run (in, p, bank) == in, "Mix 0 changed the audio");
+        std::printf ("  stopped transport, Engage off and Mix 0: bit-identical\n");
+    }
+
+    // DAW cycle: the grid re-locks on the loop start.
+    {
+        gn::CoreParams p;
+        p.crossfadeMs = 0.0f;
+        const auto bank = bankWith ([] (gn::Pattern& pat) { pat[0] = gn::makeStep (T::repeat, gn::kDiv32); });
+        RunConfig cfg; cfg.fixedBlock = 512;
+        const double spq = 24000.0;
+        const size_t loopLen = (size_t) (8.0 * spq);
+        const size_t total = loopLen * 3 + 7000;
+        std::vector<double> ppq (total);
+        for (size_t n = 0; n < total; ++n) ppq[n] = (double) (n % loopLen) / spq;
+
+        const auto out = run (counterSignal (total), p, bank, cfg, &ppq);
+        bool ok = true;
+        for (size_t L = loopLen; L < total; L += loopLen)
+            if (L + 3000 < total && (size_t) out[L + 3000] != L) ok = false;
+        CHECK (ok, "grid didn't re-lock after the loop jump");
+        std::printf ("  DAW loop: re-locks on every loop start\n");
+    }
 }
 
 int main()
 {
-    testGridAccuracy (48000.0, 120.0, 2, 7, "48k, 120 BPM, grid 1/16, repeat 1/32");
-    testGridAccuracy (44100.0, 133.0, 5, 9, "44.1k, 133 BPM, grid 1/16T, repeat 1/64");
-    testGridAccuracy (96000.0, 97.3, 1, 4, "96k, 97.3 BPM, grid 1/8, repeat 1/8T");
-    testGridAccuracy (88200.0, 174.0, 3, 9, "88.2k, 174 BPM, grid 1/32, repeat 1/64");
-    testGridAccuracy (48000.0, 90.0, 0, 3, "48k, 90 BPM, grid 1/4, repeat 1/16D");
-    testTypes();
-    testBlockSizeIndependence();
-    testCrossfade();
-    testProbability();
-    testPassThrough();
-    testLoopJump();
+    testGridAccuracy (48000.0, 120.0, 2, gn::kDiv32, 0.5,  "48k, 120 BPM, grid 1/16, repeat 1/32");
+    testGridAccuracy (44100.0, 133.0, 5, gn::kDiv64, 0.5,  "44.1k, 133 BPM, grid 1/16T, repeat 1/64");
+    testGridAccuracy (96000.0, 97.3, 1, 4, 0.5,            "96k, 97.3 BPM, grid 1/8, repeat 1/8T");
+    testGridAccuracy (88200.0, 174.0, 3, gn::kDiv64, 0.5,  "88.2k, 174 BPM, grid 1/32, repeat 1/64");
+    testGridAccuracy (48000.0, 90.0, 0, gn::kDiv16D, 0.5,  "48k, 90 BPM, grid 1/4, repeat 1/16D");
+    testGridAccuracy (48000.0, 120.0, 2, gn::kDiv64, 0.66, "48k, 120 BPM, grid 1/16, swing 66%");
+    testGridAccuracy (44100.0, 101.0, 1, gn::kDiv32, 0.75, "44.1k, 101 BPM, grid 1/8, swing 75%");
+    testTypeDefaults();
+    testTypeControls();
+    testNewTypes();
+    testStepShaping();
+    testRandomness();
+    testLive();
+    testSafety();
 
     std::printf (gFailures == 0 ? "\nALL TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;

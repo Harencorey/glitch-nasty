@@ -2,28 +2,18 @@
 //==============================================================================
 // Glitch Nasty - the step pattern grid.
 //
-// Each column is one step:
-//   number   lights up as the playhead passes; magenta when that step is glitching
-//   pad      click to switch the step on/off (click-drag paints across steps)
-//   type     click for the stutter type menu (Repeat, Reverse, Gate, Roll ...)
-//   chance   drag up/down for the probability (drag across steps to draw a curve);
-//            double-click = 100 %
+// Each column is one step of the pattern being edited:
+//   number   click to select the step (its controls open in the step editor);
+//            lights green as the playhead passes, pink while it's glitching
+//   pad      click to switch the step on/off (click-drag paints across steps);
+//            a tied step draws as one long pad across the steps it covers
+//   type     click for the glitch type menu
+//   chance   drag up/down (drag sideways to draw across steps); double-click = 100 %
 //   repeat   click for the repeat length menu
 //==============================================================================
 
 #include "PluginProcessor.h"
-#include <juce_gui_basics/juce_gui_basics.h>
-
-namespace gn::colours
-{
-const juce::Colour background { 0xff0e0f11 };
-const juce::Colour panel      { 0xff191a1e };
-const juce::Colour outline    { 0xff2b2d33 };
-const juce::Colour text       { 0xffd8dade };
-const juce::Colour dimText    { 0xff6c6f78 };
-const juce::Colour acid       { 0xffb6ff3b };
-const juce::Colour nasty      { 0xffff2e88 };
-} // namespace gn::colours
+#include "Theme.h"
 
 class StepGrid : public juce::Component,
                  public juce::TooltipClient,
@@ -31,7 +21,10 @@ class StepGrid : public juce::Component,
 {
 public:
     explicit StepGrid (GlitchNastyProcessor&);
-    ~StepGrid() override;
+
+    std::function<void (int)> onStepSelected;
+    void setSelectedStep (int step);
+    int getSelectedStep() const noexcept { return selected; }
 
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
@@ -44,34 +37,24 @@ private:
     enum class Row { none, number, pad, type, chance, repeat };
     enum class DragMode { none, paintPads, drawChance };
 
-    struct StepParams
-    {
-        juce::RangedAudioParameter* on = nullptr;
-        juce::RangedAudioParameter* chance = nullptr;
-        juce::RangedAudioParameter* repeat = nullptr;
-        juce::RangedAudioParameter* type = nullptr;
-    };
-
-    void timerCallback() override;
+    void timerCallback() override { repaint(); }
 
     int columnAt (float x) const;
     Row rowAt (float y) const;
     juce::Rectangle<float> cell (int column, Row row) const;
-    int numActiveSteps() const;
+    juce::Rectangle<float> columnBounds (int column) const;
 
-    void setParam (juce::RangedAudioParameter* p, float plainValue);
-    void touch (int column, juce::RangedAudioParameter* p);
-    void releaseAllGestures();
+    // owner[i] == i for a normal step; otherwise the tied step that covers it.
+    static std::array<int, gn::kMaxSteps> coverOwners (const gn::Pattern&, int numSteps);
+
+    void select (int step);
     void setChanceFromY (int column, float y);
     void showChoiceMenu (int column, Row row);
 
     GlitchNastyProcessor& processor;
-    std::array<StepParams, gn::kMaxSteps> steps;
-    juce::RangedAudioParameter* stepsParam = nullptr;
-
+    int selected = 0;
     DragMode dragMode = DragMode::none;
     bool paintValue = false;
-    std::array<juce::RangedAudioParameter*, gn::kMaxSteps> touched {};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StepGrid)
 };

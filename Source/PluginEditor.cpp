@@ -2,60 +2,9 @@
 
 using namespace gn::colours;
 
-//==============================================================================
-GlitchNastyLookAndFeel::GlitchNastyLookAndFeel()
-{
-    setColour (juce::ResizableWindow::backgroundColourId, background);
-    setColour (juce::Slider::textBoxTextColourId, text);
-    setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-    setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
-    setColour (juce::Label::textColourId, text);
-    setColour (juce::ComboBox::backgroundColourId, panel);
-    setColour (juce::ComboBox::outlineColourId, outline);
-    setColour (juce::ComboBox::textColourId, text);
-    setColour (juce::ComboBox::arrowColourId, acid);
-    setColour (juce::PopupMenu::backgroundColourId, panel);
-    setColour (juce::PopupMenu::textColourId, text);
-    setColour (juce::PopupMenu::highlightedBackgroundColourId, acid);
-    setColour (juce::PopupMenu::highlightedTextColourId, background);
-    setColour (juce::TextButton::buttonColourId, panel);
-    setColour (juce::TextButton::buttonOnColourId, acid);
-    setColour (juce::TextButton::textColourOffId, acid);
-    setColour (juce::TextButton::textColourOnId, background);
-    setColour (juce::TooltipWindow::backgroundColourId, panel.brighter (0.15f));
-    setColour (juce::TooltipWindow::textColourId, text);
-    setColour (juce::TooltipWindow::outlineColourId, outline);
-}
-
-void GlitchNastyLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int width, int height,
-                                               float sliderPos, float startAngle, float endAngle, juce::Slider& slider)
-{
-    auto bounds = juce::Rectangle<int> (x, y, width, height).toFloat().reduced (4.0f);
-    const float radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
-    const auto centre = bounds.getCentre();
-    const float angle = startAngle + sliderPos * (endAngle - startAngle);
-    const float alpha = slider.isEnabled() ? 1.0f : 0.35f;
-
-    juce::Path track, value;
-    track.addCentredArc (centre.x, centre.y, radius - 3.0f, radius - 3.0f, 0.0f, startAngle, endAngle, true);
-    value.addCentredArc (centre.x, centre.y, radius - 3.0f, radius - 3.0f, 0.0f, startAngle, angle, true);
-
-    const juce::PathStrokeType stroke (4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
-    g.setColour (outline.withMultipliedAlpha (alpha));
-    g.strokePath (track, stroke);
-    g.setColour (acid.withMultipliedAlpha (alpha));
-    g.strokePath (value, stroke);
-
-    g.setColour (panel);
-    g.fillEllipse (juce::Rectangle<float> (radius * 1.3f, radius * 1.3f).withCentre (centre));
-    const auto tip = centre.getPointOnCircumference (radius * 0.6f, angle);
-    g.setColour (text.withMultipliedAlpha (alpha));
-    g.drawLine ({ centre.getPointOnCircumference (radius * 0.2f, angle), tip }, 2.0f);
-}
-
-//==============================================================================
 GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
-    : AudioProcessorEditor (&p), processor (p), grid (p)
+    : AudioProcessorEditor (&p), processor (p),
+      patternBar (p), grid (p), stepEditor (p), livePanel (p)
 {
     setLookAndFeel (&lookAndFeel);
 
@@ -66,13 +15,21 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
     setupCombo (gridBox, gridLabel, gn::ids::grid, "GRID",
                 "How long each step is. 16 steps of 1/16 = one bar of 4/4; 1/4 = four bars.", gridAttachment);
 
-    setupKnob (bpm, gn::ids::bpm, "BPM", "Internal tempo. Used in Standalone, or with Sync set to Internal. Tap the TAP button to set it.");
-    setupKnob (steps, gn::ids::steps, "STEPS", "Pattern length. Steps past this are skipped (shown dim). Odd lengths drift against the bar for polyrhythms.");
-    setupKnob (xfade, gn::ids::xfade, "X-FADE", "Crossfade at every loop point. ~3 ms is clean on almost anything; 0 ms is hard cuts with clicks (sometimes that's the point); longer gets smeary.");
-    setupKnob (mix, gn::ids::mix, "MIX", "How much of the glitch you hear while a step is firing. Between glitches you always hear the dry signal untouched.");
-    setupKnob (output, gn::ids::output, "OUTPUT", "Output trim.");
+    attachKnob (bpm, bpmAtt, gn::ids::bpm, "BPM", "Internal tempo. Used in Standalone, or with Sync set to Internal. Tap the TAP button to set it.");
+    attachKnob (steps, stepsAtt, gn::ids::steps, "STEPS", "Pattern length. Steps past this are skipped (shown dim). Odd lengths drift against the bar for polyrhythms.");
+    attachKnob (swing, swingAtt, gn::ids::swing, "SWING", "Pushes every second step late, MPC-style. 50% = straight, 66% = triplet feel, 75% = hard shuffle.");
+    attachKnob (xfade, xfadeAtt, gn::ids::xfade, "X-FADE", "Crossfade at every loop point. ~3 ms is clean on almost anything; 0 ms is hard cuts with clicks (sometimes that's the point); longer gets smeary.");
+    attachKnob (mix, mixAtt, gn::ids::mix, "MIX", "How much of the glitch you hear while a step is firing. Between glitches you always hear the dry signal untouched.");
+    attachKnob (density, densityAtt, gn::ids::density, "DENSITY",
+                "Scales every step's chance. Negative thins the pattern out (-100% = nothing fires), positive fills it in "
+                "(+100% = every on-step fires). Great to automate into a drop.", true);
+    attachKnob (seed, seedAtt, gn::ids::seed, "SEED",
+                "The dice behind Chance, Variation, Shuffle and Freeze texture. The same seed always makes the same decisions at the "
+                "same point in the song, so a happy accident bounces the same every time. Change it for a new take.");
+    attachKnob (output, outputAtt, gn::ids::output, "OUTPUT", "Output trim.");
 
     tapButton.setTooltip ("Tap on the beat to set the internal tempo (averages your last 4 taps). Each tap also snaps the grid to the nearest beat, so you can line it up with a live band.");
+    tapButton.setColour (juce::TextButton::textColourOffId, acid);
     tapButton.onClick = [this] { tap(); };
     addAndMakeVisible (tapButton);
 
@@ -81,9 +38,25 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
     clockReadout.setTooltip ("The clock actually driving the grid right now.");
     addAndMakeVisible (clockReadout);
 
-    addAndMakeVisible (grid);
+    engageButton.setClickingTogglesState (true);
+    engageButton.setTooltip ("Pattern on/off. Changes land on the next bar line, so you can hit it early. "
+                             "A sustain pedal / footswitch (MIDI CC64) toggles it too - handy for guitar live. Live pads and notes always work.");
+    addAndMakeVisible (engageButton);
+    engageAttachment = std::make_unique<ButtonAttachment> (processor.apvts, gn::ids::engage, engageButton);
+    engageStatus.setJustificationType (juce::Justification::centred);
+    engageStatus.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+    addAndMakeVisible (engageStatus);
 
-    setSize (960, 490);
+    addAndMakeVisible (patternBar);
+    addAndMakeVisible (grid);
+    addAndMakeVisible (stepEditor);
+    addAndMakeVisible (livePanel);
+
+    grid.onStepSelected = [this] (int s) { stepEditor.setStep (s); };
+    grid.setSelectedStep (3);
+    stepEditor.setStep (3);
+
+    setSize (1100, 740);
     startTimerHz (10);
 }
 
@@ -92,20 +65,12 @@ GlitchNastyEditor::~GlitchNastyEditor()
     setLookAndFeel (nullptr);
 }
 
-void GlitchNastyEditor::setupKnob (Knob& k, const char* paramId, const juce::String& name, const juce::String& help)
+void GlitchNastyEditor::attachKnob (gn::ui::Knob& k, std::unique_ptr<SliderAttachment>& att, const char* paramId,
+                                    const juce::String& name, const juce::String& help, bool bipolar)
 {
-    k.slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
-    k.slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
-    k.slider.setColour (juce::Slider::textBoxTextColourId, text);
-    k.slider.setTooltip (help);
-    addAndMakeVisible (k.slider);
-    k.attachment = std::make_unique<SliderAttachment> (processor.apvts, paramId, k.slider);
-
-    k.label.setText (name, juce::dontSendNotification);
-    k.label.setJustificationType (juce::Justification::centred);
-    k.label.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-    k.label.setColour (juce::Label::textColourId, dimText);
-    addAndMakeVisible (k.label);
+    k.setup (*this, name, help);
+    k.slider.getProperties().set ("bipolar", bipolar);
+    att = std::make_unique<SliderAttachment> (processor.apvts, paramId, k.slider);
 }
 
 void GlitchNastyEditor::setupCombo (juce::ComboBox& box, juce::Label& label, const char* paramId, const juce::String& name,
@@ -142,10 +107,10 @@ void GlitchNastyEditor::tap()
         const double avgMs = (tapTimes.back() - tapTimes.front()) / (double) (tapTimes.size() - 1);
         const float newBpm = (float) juce::jlimit (40.0, 300.0, 60000.0 / avgMs);
 
-        auto* p = processor.apvts.getParameter (gn::ids::bpm);
-        p->beginChangeGesture();
-        p->setValueNotifyingHost (p->convertTo0to1 (newBpm));
-        p->endChangeGesture();
+        auto* param = processor.apvts.getParameter (gn::ids::bpm);
+        param->beginChangeGesture();
+        param->setValueNotifyingHost (param->convertTo0to1 (newBpm));
+        param->endChangeGesture();
     }
 }
 
@@ -160,6 +125,20 @@ void GlitchNastyEditor::timerCallback()
     // The BPM knob and TAP only matter when the internal clock is running.
     bpm.slider.setEnabled (! host);
     tapButton.setEnabled (! host);
+
+    // Engage status: what's actually happening (the footswitch can flip it).
+    const bool engaged = processor.uiEngaged.load(), pending = processor.uiEngagePending.load();
+    blink = (blink + 1) % 10;
+    juce::String status = engaged ? "PATTERN ON" : "PATTERN OFF";
+    auto colour = engaged ? acid : dimText;
+    if (pending)
+    {
+        status = engaged ? "OFF AT NEXT BAR" : "ON AT NEXT BAR";
+        colour = blink < 5 ? nasty : nasty.withAlpha (0.4f);
+    }
+    if (engageStatus.getText() != status)
+        engageStatus.setText (status, juce::dontSendNotification);
+    engageStatus.setColour (juce::Label::textColourId, colour);
 }
 
 //==============================================================================
@@ -185,39 +164,46 @@ void GlitchNastyEditor::resized()
     auto area = getLocalBounds().reduced (20, 0);
     area.removeFromTop (60);
 
-    auto controls = area.removeFromTop (118);
-    const int colW = 92;
+    // Global controls
+    auto controls = area.removeFromTop (112);
+    constexpr int knobW = 78, comboW = 96;
 
-    auto placeKnob = [&] (Knob& k)
-    {
-        auto col = controls.removeFromLeft (colW);
-        k.label.setBounds (col.removeFromTop (18));
-        k.slider.setBounds (col.reduced (4, 0));
-    };
     auto placeCombo = [&] (juce::ComboBox& box, juce::Label& label)
     {
-        auto col = controls.removeFromLeft (colW + 8);
+        auto col = controls.removeFromLeft (comboW);
         label.setBounds (col.removeFromTop (18));
         box.setBounds (col.withSizeKeepingCentre (col.getWidth() - 12, 26).withY (col.getY() + 24));
     };
 
     placeCombo (syncBox, syncLabel);
-    placeKnob (bpm);
+    bpm.setBounds (controls.removeFromLeft (knobW));
     {
-        auto col = controls.removeFromLeft (colW + 20);
+        auto col = controls.removeFromLeft (104);
         col.removeFromTop (18);
-        tapButton.setBounds (col.removeFromTop (34).reduced (8, 0));
-        col.removeFromTop (8);
-        clockReadout.setBounds (col.removeFromTop (40));
+        tapButton.setBounds (col.removeFromTop (32).reduced (8, 0));
+        col.removeFromTop (6);
+        clockReadout.setBounds (col.removeFromTop (36));
     }
-    controls.removeFromLeft (16);
+    controls.removeFromLeft (8);
     placeCombo (gridBox, gridLabel);
-    placeKnob (steps);
-    controls.removeFromLeft (16);
-    placeKnob (xfade);
-    placeKnob (mix);
-    placeKnob (output);
+    for (auto* k : { &steps, &swing, &xfade, &mix, &density, &seed, &output })
+        k->setBounds (controls.removeFromLeft (knobW));
+    {
+        auto col = controls.removeFromRight (110);
+        col.removeFromTop (18);
+        engageButton.setBounds (col.removeFromTop (34).reduced (4, 0));
+        col.removeFromTop (6);
+        engageStatus.setBounds (col.removeFromTop (20));
+    }
 
-    area.removeFromTop (14);
-    grid.setBounds (area.removeFromTop (area.getHeight() - 18));
+    area.removeFromTop (8);
+    patternBar.setBounds (area.removeFromTop (28));
+    area.removeFromTop (10);
+    grid.setBounds (area.removeFromTop (262));
+    area.removeFromTop (12);
+
+    auto bottom = area.removeFromTop (226);
+    livePanel.setBounds (bottom.removeFromRight (430));
+    bottom.removeFromRight (12);
+    stepEditor.setBounds (bottom);
 }

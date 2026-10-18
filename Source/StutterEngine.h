@@ -5,29 +5,32 @@
 // Think of this as a tape loop that is ALWAYS recording, with a playback head
 // that normally sits right on top of the record head (so you hear the input
 // with zero delay). When a stutter starts, we remember where the record head
-// was ("sliceStart"). For the first pass the playback head just rides along
-// with the record head, so you still hear live audio - that's why there's no
-// latency. When the slice length is reached, the playback head jumps back and
-// replays that chunk until the step ends.
+// was ("sliceStart"). For most types the first pass just rides along with the
+// record head, so you still hear live audio - that's why there's no latency.
+// At each loop point the playback head jumps somewhere in the audio that has
+// already been recorded, and the TYPE decides where, how fast and how loud:
 //
-// The stutter TYPE decides what each replay does:
-//   Repeat     same slice, same speed
-//   Reverse    slice played backwards
-//   Gate       no looping: the live signal is chopped on/off in time
-//   Roll       each repeat half as long as the last (build-up roll)
-//   Pitch +12  repeats at double speed (whole slice, twice as often)
-//   Pitch -12  repeats at half speed (first half of the slice, an octave down)
-//   Tape Stop  no looping: playback slows to a halt over the repeat length
-//   Fade       each repeat quieter than the last (dying echo)
+//   Repeat     the same slice again (Offset: which slice, Variation: humanize)
+//   Reverse    the slice backwards (or ping-pong back/forth)
+//   Gate       no jumps: the live signal is chopped on/off (duty, shape)
+//   Roll       each repeat shorter (speed up) or longer (slow down)
+//   Pitch      repeats played faster/slower (+-24 st), with optional glide
+//   Tape Stop  no jumps: playback slows to a halt (or spins up from nothing)
+//   Fade       each repeat quieter (or louder: fade in)
+//   Shuffle    each slice replaced by an earlier slice, maybe reversed
+//   Freeze     two overlapping windowed grains hold a moment as a drone
+//   Scratch    the head is dragged back and forth like vinyl
+//   Ping-Pong  repeats alternate left/right
 //
-// The playback head has a speed ("rate") and a level ("gain"). Every jump is
-// covered by a short equal-power crossfade: the old head keeps playing and
-// fades out while the new head fades in (an angled tape splice, not a cut).
+// Every jump is covered by a short crossfade (an angled tape splice, not a
+// cut). After the type, each step's level, pan and filter shape the wet sound.
 //
 // Real-time safety: all memory is allocated in prepare(). process() never
 // allocates, locks or does I/O. No JUCE dependency, so the offline tests can
 // compile it on their own.
 //==============================================================================
+
+#include "Pattern.h"
 
 #include <algorithm>
 #include <array>
@@ -39,43 +42,50 @@
 namespace gn
 {
 
-enum class StutterType : int
+// Small, fast, deterministic hash -> random numbers that depend only on the
+// seed and on where we are, so a bounce always sounds the same.
+inline uint32_t hash32 (uint32_t x) noexcept
 {
-    repeat = 0,
-    reverse,
-    gate,
-    roll,
-    pitchUp,
-    pitchDown,
-    tapeStop,
-    fade
-};
-constexpr int kNumStutterTypes = 8;
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+inline float rand01 (uint32_t seed, uint32_t a, uint32_t b = 0) noexcept
+{
+    const uint32_t h = hash32 (seed ^ hash32 (a * 0x9E3779B9u + hash32 (b + 0x632BE5ABu)));
+    return (float) (h >> 8) * (1.0f / 16777216.0f);
+}
 
 struct StutterSettings
 {
     StutterType type = StutterType::repeat;
     double sliceLen = 0.0;   // repeat length, in samples (may be fractional)
-    double stepLen = 0.0;    // how long this step lasts, in samples
+    double stepLen = 0.0;    // how long this glitch lasts (incl. ties), in samples
     double lateBy = 0.0;     // the true grid line was this far (0..1 samples) before this sample
     double minPeriod = 32.0; // shortest repeat a Roll may reach, in samples
     int fadeSamples = 0;     // crossfade length at every jump
+    float p1 = 0.0f, p2 = 0.0f; // the type's two controls (0..1)
+    float level = 1.0f;      // linear gain
+    float pan = 0.0f;        // -1..+1
+    float filter = 0.0f;     // -1 (LP) .. +1 (HP)
+    uint32_t seed = 0;       // for Variation / Shuffle / Freeze texture
 };
 
 class StutterEngine
 {
 public:
     static constexpr int kMaxChannels = 2;
-    static constexpr float kFadeDecay = 0.6f;  // Fade type: each repeat -4.4 dB
-    static constexpr double kGateDuty = 0.5;   // Gate type: open for the first half of each repeat
 
-    // Call from prepareToPlay (allocates).
-    void prepare (int numChannels, double sampleRate, double maxSliceSeconds)
+    // Call from prepareToPlay (allocates). bufferSeconds = longest audio we can reach back for.
+    void prepare (int numChannels, double sampleRate, double bufferSeconds)
     {
         channels = std::clamp (numChannels, 1, kMaxChannels);
+        sr = sampleRate;
 
         // Ring buffer sized to a power of two so wrapping is a cheap bit-mask.
-        const auto needed = (int64_t) std::ceil (sampleRate * maxSliceSeconds) + kSafetySamples;
+        const auto needed = (int64_t) std::ceil (sampleRate * bufferSeconds) + kSafetySamples;
         int64_t cap = 1;
         while (cap < needed)
             cap <<= 1;
@@ -87,6 +97,7 @@ public:
             b.assign ((size_t) capacity, 0.0f);
 
         mixSmoothingSamples = std::max (1, (int) (0.02 * sampleRate)); // 20 ms
+        filterSmooth = (float) std::exp (-1.0 / (0.005 * sampleRate));  // 5 ms
         reset();
     }
 
@@ -99,16 +110,23 @@ public:
         head = Head {};
         fadeHead = Head {};
         fadeLen = fadeRemaining = 0;
+        fadeLinear = false;
         stuttering = false;
         type = StutterType::repeat;
         sliceStart = 0;
-        sliceLen = stepLen = gridPhase = period = 0.0;
+        sliceLen = stepLen = gridPhase = 0.0;
+        regionStart = oldestNeeded = 0.0;
         elapsed = 0;
         repeatIndex = 0;
         nextWrapT = 0.0;
         nextWrap = std::numeric_limits<int64_t>::max();
         gateGain = 1.0f;
-        gateStep = 1.0f;
+        gateUp = gateDown = 1.0f;
+        lpAmt = hpAmt = lpAmtT = hpAmtT = 0.0f;
+        lpLog = lpLogT = std::log (20000.0f);
+        hpLog = hpLogT = std::log (20.0f);
+        for (auto& f : lpState) f = {};
+        for (auto& f : hpState) f = {};
         mixCurrent = mixTarget;
         mixStep = 0.0f;
         mixRampLeft = 0;
@@ -136,35 +154,123 @@ public:
         mixStep = (mixTarget - mixCurrent) / (float) mixRampLeft;
     }
 
-    // Start a new stutter at the next sample process() handles.
+    // Start a new glitch at the next sample process() handles.
     void startStutter (const StutterSettings& s)
     {
         type = s.type;
+        p1 = s.p1;
+        p2 = s.p2;
+        seed = s.seed;
+        level = std::max (0.0f, s.level);
+        pan = std::clamp (s.pan, -1.0f, 1.0f);
         sliceLen = std::clamp (s.sliceLen, 16.0, maxSliceSamples());
         stepLen = s.stepLen;
         gridPhase = s.lateBy;
         fadeSamples = std::max (s.fadeSamples, 0);
         minPeriod = std::max (16.0, s.minPeriod);
+        slicesPerStep = slicesIn (stepLen, sliceLen);
 
-        // The first pass is always the live signal (that's the zero latency).
-        if (stuttering)
-            beginJump ((double) writeCount, 1.0, 1.0f, fadeSamples); // leave the old slice
-        else
-            head = { (double) writeCount, 1.0, 1.0f };
-
-        stuttering = true;
+        const double S = (double) writeCount;
         sliceStart = writeCount;
+        regionStart = S;
+        oldestNeeded = S;
         elapsed = 0;
         repeatIndex = 0;
-        period = sliceLen;
-
-        // Gate and Tape Stop never loop; the others loop at the end of the first pass.
         nextWrapT = sliceLen;
-        scheduleWrap (type != StutterType::gate && type != StutterType::tapeStop);
+        bool loops = true;
 
-        // Gate edges get the crossfade length as their ramp (capped so short gates still open).
-        const double ramp = std::min ((double) fadeSamples, sliceLen * kGateDuty * 0.5);
-        gateStep = ramp >= 1.0 ? (float) (1.0 / ramp) : 1.0f;
+        Head h = liveHead (S);
+        setGains (h, level, pan);
+
+        switch (type)
+        {
+            case StutterType::repeat:
+            case StutterType::reverse:
+            {
+                const int o = sliceOffset (type == StutterType::repeat ? p1 : p2, slicesPerStep);
+                regionStart = S + (double) o * sliceLen;
+                nextWrapT = (double) (o + 1) * sliceLen;
+                oldestNeeded = S - (type == StutterType::repeat ? 0.25 * sliceLen : 0.0);
+                break;
+            }
+            case StutterType::gate:
+                loops = false;
+                break;
+            case StutterType::tapeStop:
+                loops = false;
+                if (choiceIndex (p1, 2) == 1)
+                    h.rate = 0.0; // tape start: spins up from a standstill
+                break;
+            case StutterType::fade:
+                if (choiceIndex (p2, 2) == 1) // fade in: the first pass is the quietest
+                    h.amp = (float) std::pow (fadeFactor (p1), (double) (slicesPerStep - 1));
+                break;
+            case StutterType::shuffle:
+                oldestNeeded = S - (double) (slicesPerStep - 1) * sliceLen;
+                break;
+            case StutterType::freeze:
+            {
+                loops = false;
+                const double G = std::clamp (freezeGrainMs (p1) * 0.001 * sr, 16.0, sr);
+                h.mode = HeadMode::freeze;
+                h.len = G;
+                h.base = S - G;          // the grain is the moment just before the step
+                h.t = 0.0;
+                h.texture = clamp01 (p2);
+                h.seed = seed;
+                oldestNeeded = S - 2.0 * G;
+                break;
+            }
+            case StutterType::scratch:
+            {
+                loops = false;
+                const double A = std::max (16.0, scratchDepth (p1) * sliceLen);
+                h.mode = HeadMode::scratch;
+                h.len = A;
+                h.base = S - A;          // swings between S - A and S (never the future)
+                h.period = sliceLen / scratchSpeed (p2);
+                h.t = 0.5 * h.period;    // start at the top of the swing, where pos == S
+                h.pos = scratchPos (h);
+                oldestNeeded = S - A;
+                break;
+            }
+            case StutterType::roll:
+            case StutterType::pitch:
+            case StutterType::pingPong:
+                break;
+        }
+
+        // Shuffle can reach back several slices; never further than the buffer holds.
+        maxLookbackSlices = std::max (0, (int) ((double) (capacity - 2 * kSafetySamples) / sliceLen) - 2);
+
+        const bool alreadyThere = ! stuttering && fadeRemaining == 0 && isPlainLive (head) && isPlainLive (h)
+                                  && std::abs (h.pos - head.pos) < 0.5;
+        if (alreadyThere)
+            head = h;
+        else
+            beginJump (h, fadeSamples);
+
+        stuttering = true;
+        scheduleWrap (loops);
+
+        // Gate edges
+        if (type == StutterType::gate)
+        {
+            const double duty = gateDuty (p1);
+            const double shortest = sliceLen * std::min (duty, 1.0 - duty);
+            switch (choiceIndex (p2, 3))
+            {
+                case 0:  gateUp = gateDown = rampStep (std::min ((double) fadeSamples, shortest * 0.5)); break; // hard
+                case 1:  gateUp = gateDown = rampStep (shortest * 0.5); break;                                 // soft
+                default: gateUp = 1.0f; gateDown = rampStep (std::min ((double) fadeSamples, sliceLen * 0.05)); break; // pump
+            }
+        }
+        else
+        {
+            gateUp = gateDown = rampStep ((double) fadeSamples);
+        }
+
+        setFilterTarget (s.filter);
     }
 
     // Return to the live input at the next sample (crossfaded).
@@ -174,14 +280,14 @@ public:
             return;
 
         stuttering = false;
-        beginJump ((double) writeCount, 1.0, 1.0f, fadeSamplesForReturn);
-        const double ramp = (double) std::max (fadeSamplesForReturn, 0);
-        gateStep = ramp >= 1.0 ? (float) (1.0 / ramp) : 1.0f;
+        beginJump (liveHead ((double) writeCount), fadeSamplesForReturn);
+        gateUp = gateDown = rampStep ((double) std::max (fadeSamplesForReturn, 0));
+        setFilterTarget (0.0f);
     }
 
     bool isStuttering() const noexcept { return stuttering; }
     int64_t getCapacity() const noexcept { return capacity; }
-    double maxSliceSamples() const noexcept { return (double) (capacity - kSafetySamples); }
+    double maxSliceSamples() const noexcept { return (double) (capacity - 2 * kSafetySamples) * 0.25; }
 
     // Processes io[ch][start .. start+num) in place.
     void process (float* const* io, int numCh, int start, int num) noexcept
@@ -204,124 +310,321 @@ public:
                     mixCurrent = mixTarget;
             }
 
-            // 2) Gate level (moves toward open/closed with a short ramp).
+            // 2) Never play audio the tape has already recorded over: very long holds return to live.
+            if (stuttering && (double) w - oldestNeeded > (double) (capacity - 2 * kSafetySamples))
+                stopStutter (fadeSamples);
+
+            // 3) Gate level (slews toward open/closed).
             float gateTarget = 1.0f;
             if (stuttering && type == StutterType::gate)
             {
-                const double t = (double) elapsed + gridPhase;
-                gateTarget = std::fmod (t, sliceLen) < sliceLen * kGateDuty ? 1.0f : 0.0f;
+                const double phase = std::fmod ((double) elapsed + gridPhase, sliceLen) / sliceLen;
+                const double duty = gateDuty (p1);
+                if (choiceIndex (p2, 3) == 2)
+                {
+                    const double x = std::min (1.0, phase / duty);
+                    gateTarget = (float) (x * x);
+                }
+                else
+                {
+                    gateTarget = phase < duty ? 1.0f : 0.0f;
+                }
             }
-            if (gateGain < gateTarget)      gateGain = std::min (gateTarget, gateGain + gateStep);
-            else if (gateGain > gateTarget) gateGain = std::max (gateTarget, gateGain - gateStep);
+            if (gateGain < gateTarget)      gateGain = std::min (gateTarget, gateGain + gateUp);
+            else if (gateGain > gateTarget) gateGain = std::max (gateTarget, gateGain - gateDown);
 
-            // 3) Fast path: not glitching, no fade tail, gate open -> output == input, untouched.
-            if (! stuttering && fadeRemaining == 0 && gateGain >= 1.0f)
+            // 4) Filter amounts and cutoffs glide (5 ms) so step changes never click.
+            const bool filterActive = updateFilterSmoothing();
+
+            // 5) Fast path: nothing going on -> output == input, untouched (bit-identical).
+            if (! stuttering && fadeRemaining == 0 && gateGain >= 1.0f && ! filterActive)
             {
                 ++writeCount;
-                head = { (double) writeCount, 1.0, 1.0f };
+                head = liveHead ((double) writeCount);
                 continue;
             }
 
-            // 4) Loop point reached? Start the next repeat.
+            // 6) Loop point reached? Start the next repeat.
             if (stuttering && elapsed >= nextWrap)
                 startNextRepeat();
 
-            // 5) Tape Stop: the head decelerates to a standstill over the repeat length.
-            if (stuttering && type == StutterType::tapeStop)
-            {
-                const double rate = std::max (0.0, 1.0 - (double) elapsed / sliceLen);
-                head.rate = rate;
-                head.gain = (float) std::min (1.0, rate * 4.0); // level drops in the last quarter, like a real deck
-            }
+            // 7) Types that move continuously.
+            if (stuttering)
+                updateContinuous();
 
-            // 6) Play back (with crossfade if one is running).
+            // 8) Play back (with crossfade if one is running).
             float gIn = 1.0f, gOut = 0.0f;
             const bool fading = fadeRemaining > 0;
             if (fading)
             {
                 const double t = ((double) (fadeLen - fadeRemaining) + 0.5) / (double) fadeLen;
-                gIn  = (float) std::sin (t * halfPi);
-                gOut = (float) std::cos (t * halfPi);
+                if (fadeLinear) { gIn = (float) t; gOut = (float) (1.0 - t); }       // same audio, new gain
+                else            { gIn = (float) std::sin (t * halfPi); gOut = (float) std::cos (t * halfPi); }
             }
 
             for (int c = 0; c < numCh; ++c)
             {
                 const float dry = io[c][i];
-                float wet = read (c, head.pos) * head.gain;
+                float wet = readHead (c, head) * chanGain (head, c);
                 if (fading)
-                    wet = wet * gIn + read (c, fadeHead.pos) * fadeHead.gain * gOut;
+                    wet = wet * gIn + readHead (c, fadeHead) * chanGain (fadeHead, c) * gOut;
                 wet *= gateGain;
+                if (filterActive)
+                    wet = applyFilter (c, wet);
 
                 io[c][i] = dry + mixCurrent * (wet - dry);
             }
 
-            head.pos += head.rate;
+            advance (head);
             if (fading)
             {
-                fadeHead.pos += fadeHead.rate;
+                advance (fadeHead);
                 --fadeRemaining;
             }
 
             ++elapsed;
             ++writeCount;
             if (! stuttering && fadeRemaining == 0)
-                head = { (double) writeCount, 1.0, 1.0f }; // back on the record head, exactly
+                head = liveHead ((double) writeCount); // back on the record head, exactly
         }
     }
 
 private:
     static constexpr int64_t kSafetySamples = 4096;
 
+    enum class HeadMode : uint8_t { linear, freeze, scratch };
+
     struct Head
     {
+        HeadMode mode = HeadMode::linear;
         double pos = 0.0;  // absolute playback position (in samples recorded so far)
         double rate = 1.0; // 1 = normal speed, 2 = octave up, -1 = backwards
-        float gain = 1.0f;
+        float gL = 1.0f, gR = 1.0f, amp = 1.0f;
+        // freeze / scratch
+        double base = 0.0, len = 0.0, t = 0.0, period = 0.0;
+        float texture = 0.0f;
+        uint32_t seed = 0;
+        // pitch: loop inside [regionStart, regionStart + regionLen)
+        bool wrapInRegion = false;
+        double regionStart = 0.0, regionLen = 0.0;
     };
+
+    struct SvfState { float ic1 = 0.0f, ic2 = 0.0f; };
+
+    static Head liveHead (double pos) noexcept
+    {
+        Head h;
+        h.pos = pos;
+        return h;
+    }
+
+    static bool isPlainLive (const Head& h) noexcept
+    {
+        return h.mode == HeadMode::linear && exactly (h.rate, 1.0) && exactly (h.gL, 1.0f) && exactly (h.gR, 1.0f)
+               && exactly (h.amp, 1.0f) && ! h.wrapInRegion;
+    }
+
+    static float rampStep (double rampSamples) noexcept
+    {
+        return rampSamples >= 1.0 ? (float) (1.0 / rampSamples) : 1.0f;
+    }
+
+    // Balance law: centre = unity on both sides (so a centred step is transparent).
+    void setGains (Head& h, float lvl, float p) const noexcept
+    {
+        if (channels < 2)
+            p = 0.0f;
+        h.gL = lvl * (p > 0.0f ? 1.0f - p : 1.0f);
+        h.gR = lvl * (p < 0.0f ? 1.0f + p : 1.0f);
+    }
+
+    static float chanGain (const Head& h, int c) noexcept { return (c == 0 ? h.gL : h.gR) * h.amp; }
+
+    static double scratchPos (const Head& h) noexcept
+    {
+        constexpr double twoPi = 6.28318530717958647692;
+        return h.base + h.len * 0.5 * (1.0 - std::cos (twoPi * h.t / h.period));
+    }
+
+    static void advance (Head& h) noexcept
+    {
+        switch (h.mode)
+        {
+            case HeadMode::linear:  h.pos += h.rate; break;
+            case HeadMode::freeze:  h.t += 1.0; break;
+            case HeadMode::scratch: h.t += 1.0; h.pos = scratchPos (h); break;
+        }
+    }
+
+    float readHead (int c, const Head& h) const noexcept
+    {
+        if (h.mode != HeadMode::freeze)
+            return read (c, h.pos);
+
+        // Two Hann-windowed grains half a grain apart: sin^2 + cos^2 = 1, so the
+        // level stays put. Each grain may wander backwards (texture) when it restarts.
+        constexpr double pi = 3.14159265358979323846;
+        float acc = 0.0f;
+        for (int g = 0; g < 2; ++g)
+        {
+            const double cyc = h.t / h.len + 0.5 * (double) g;
+            const double k = std::floor (cyc);
+            const double ph = cyc - k;
+            const double s = std::sin (pi * ph);
+            const double jitter = (double) h.texture * h.len * (double) rand01 (h.seed, 300u + (uint32_t) g, (uint32_t) (int64_t) k);
+            acc += (float) (s * s) * read (c, h.base - jitter + ph * h.len);
+        }
+        return acc;
+    }
 
     void startNextRepeat() noexcept
     {
         ++repeatIndex;
-        double newPos = (double) sliceStart, rate = 1.0;
-        float gain = 1.0f;
-        period = sliceLen;
+        const int k = (int) std::min<int64_t> (repeatIndex, 1 << 20);
+        const double S = (double) sliceStart;
+
+        Head h = liveHead (regionStart);
+        setGains (h, level, pan);
+        double per = sliceLen;
 
         switch (type)
         {
             case StutterType::repeat:
+                h.pos = regionStart - (double) p2 * 0.25 * sliceLen * (double) rand01 (seed, 101u, (uint32_t) k);
                 break;
+
             case StutterType::reverse:
-                newPos = (double) sliceStart + sliceLen - 1.0; // start at the end, play backwards
-                rate = -1.0;
+            {
+                const bool forward = choiceIndex (p1, 2) == 1 && (k % 2 == 0); // ping-pong
+                if (! forward)
+                {
+                    h.pos = regionStart + sliceLen - 1.0;
+                    h.rate = -1.0;
+                }
                 break;
+            }
+
             case StutterType::roll:
-                period = std::max (minPeriod, sliceLen * std::pow (0.5, (double) repeatIndex));
+            {
+                const double f = rollFactor (p2);
+                per = choiceIndex (p1, 2) == 0 ? std::max (minPeriod, sliceLen * std::pow (f, (double) k))
+                                               : sliceLen * std::pow (1.0 / f, (double) k);
+                h.pos = S;
                 break;
-            case StutterType::pitchUp:
-                period = sliceLen * 0.5; // the whole slice at double speed, twice as often
-                rate = 2.0;
+            }
+
+            case StutterType::pitch:
+                h.pos = S;
+                h.rate = pitchRate();
+                h.wrapInRegion = true; // faster than real time: loop inside the slice
+                h.regionStart = S;
+                h.regionLen = sliceLen;
                 break;
-            case StutterType::pitchDown:
-                rate = 0.5;              // the first half of the slice, an octave down
-                break;
+
             case StutterType::fade:
-                gain = std::pow (kFadeDecay, (float) repeatIndex);
+            {
+                const double f = fadeFactor (p1);
+                const int n = choiceIndex (p2, 2) == 0 ? k : std::max (0, slicesPerStep - 1 - k);
+                h.pos = S;
+                h.amp = (float) std::pow (f, (double) n);
                 break;
+            }
+
+            case StutterType::shuffle:
+            {
+                int j = k; // this slice, live
+                const int back = std::min (slicesPerStep - 1, maxLookbackSlices);
+                if (back > 0 && rand01 (seed, 202u, (uint32_t) k) < p1)
+                    j = k - 1 - std::min (back - 1, (int) (rand01 (seed, 203u, (uint32_t) k) * (float) back));
+
+                if (j == k)
+                {
+                    h.pos = (double) writeCount;
+                }
+                else
+                {
+                    h.pos = S + (double) j * sliceLen;
+                    if (rand01 (seed, 204u, (uint32_t) k) < p2)
+                    {
+                        h.pos += sliceLen - 1.0;
+                        h.rate = -1.0;
+                    }
+                }
+                break;
+            }
+
+            case StutterType::pingPong:
+            {
+                const float side = (k % 2 == 1) ? -1.0f : 1.0f;
+                setGains (h, level, std::clamp (pan + side * clamp01 (p1), -1.0f, 1.0f));
+                h.pos = S;
+                h.amp = (float) std::pow (pingDecay (p2), (double) k);
+                break;
+            }
+
             case StutterType::gate:
             case StutterType::tapeStop:
+            case StutterType::freeze:
+            case StutterType::scratch:
                 break; // never loop
         }
 
-        const int loopFade = std::min (fadeSamples, (int) (period * 0.5));
-        beginJump (newPos, rate, gain, loopFade);
+        const int loopFade = std::min (fadeSamples, (int) (per * 0.5));
+        beginJump (h, loopFade);
 
-        nextWrapT += period;
+        nextWrapT += per;
         scheduleWrap (true);
     }
 
-    // A loop point that would land on (or within half a sample of) the step's end
-    // is skipped: the next step takes over there anyway, and otherwise you'd get a
-    // 1-sample blip.
+    double pitchRate() const noexcept
+    {
+        const double progress = stepLen > 0.0 ? std::min (1.0, (double) elapsed / stepLen) : 0.0;
+        const double semis = pitchSemis (p1) + pitchSemis (p2) * progress;
+        return std::clamp (std::exp2 (semis / 12.0), 0.25, 4.0);
+    }
+
+    void updateContinuous() noexcept
+    {
+        switch (type)
+        {
+            case StutterType::tapeStop:
+            {
+                const double x = std::min (1.0, (double) elapsed / sliceLen);
+                const double e = tapeCurve (p2);
+                const double r = choiceIndex (p1, 2) == 1 ? std::pow (x, e) : std::pow (1.0 - x, e);
+                head.rate = r;
+                head.amp = (float) std::min (1.0, r * 4.0); // level drops in the last quarter, like a real deck
+                break;
+            }
+
+            case StutterType::pitch:
+                if (repeatIndex > 0)
+                {
+                    head.rate = pitchRate();
+                    if (head.wrapInRegion && head.pos >= head.regionStart + head.regionLen)
+                    {
+                        Head h = head;
+                        h.pos -= head.regionLen;
+                        beginJump (h, std::min (fadeSamples, (int) (head.regionLen * 0.25 / head.rate)));
+                    }
+                }
+                break;
+
+            case StutterType::repeat:
+            case StutterType::reverse:
+            case StutterType::gate:
+            case StutterType::roll:
+            case StutterType::fade:
+            case StutterType::shuffle:
+            case StutterType::freeze:
+            case StutterType::scratch:
+            case StutterType::pingPong:
+                break;
+        }
+    }
+
+    // A loop point that would land on (or within half a sample of) the end of
+    // the glitch is skipped: the next step takes over there anyway.
     void scheduleWrap (bool loops) noexcept
     {
         nextWrap = (! loops || nextWrapT > stepLen - 0.5)
@@ -329,11 +632,9 @@ private:
                        : (int64_t) std::llround (nextWrapT - gridPhase);
     }
 
-    void beginJump (double newPos, double newRate, float newGain, int fadeLenSamples) noexcept
+    void beginJump (const Head& incoming, int len) noexcept
     {
-        const Head incoming { newPos, newRate, newGain };
-
-        if (fadeLenSamples <= 0)
+        if (len <= 0)
         {
             head = incoming;
             fadeRemaining = 0;
@@ -346,10 +647,15 @@ private:
         if (fadeRemaining > 0 && (fadeLen - fadeRemaining) * 2 < fadeLen)
             outgoing = fadeHead;
 
+        // Same audio on both sides (only gain/pan/speed changing): a linear fade
+        // keeps the level flat. Different audio: an equal-power fade does.
+        fadeLinear = outgoing.mode == HeadMode::linear && incoming.mode == HeadMode::linear
+                     && std::abs (outgoing.pos - incoming.pos) < 1.0;
+
         fadeHead = outgoing;
         head = incoming;
-        fadeLen = fadeLenSamples;
-        fadeRemaining = fadeLenSamples;
+        fadeLen = len;
+        fadeRemaining = len;
     }
 
     float read (int c, double pos) const noexcept
@@ -365,23 +671,105 @@ private:
         return a + frac * (n - a);
     }
 
+    //==========================================================================
+    // Filter: two state-variable filters (low-pass and high-pass, like a DJ
+    // mixer's filter knob) on the wet signal, faded in and out with the glitch.
+    void setFilterTarget (float f) noexcept
+    {
+        lpAmtT = f < -0.001f ? 1.0f : 0.0f;
+        hpAmtT = f > 0.001f ? 1.0f : 0.0f;
+        if (lpAmtT > 0.0f)
+        {
+            lpLogT = (float) std::log (filterLpHz (f));
+            if (lpAmt <= 0.0f) lpLog = lpLogT; // fading in from nothing: start at the right cutoff
+        }
+        if (hpAmtT > 0.0f)
+        {
+            hpLogT = (float) std::log (filterHpHz (f));
+            if (hpAmt <= 0.0f) hpLog = hpLogT;
+        }
+    }
+
+    bool updateFilterSmoothing() noexcept
+    {
+        if (exactly (lpAmt, 0.0f) && exactly (hpAmt, 0.0f) && exactly (lpAmtT, 0.0f) && exactly (hpAmtT, 0.0f))
+            return false;
+
+        auto glide = [this] (float& v, float target, float snap)
+        {
+            v = target + filterSmooth * (v - target);
+            if (std::abs (v - target) < snap) v = target;
+        };
+        glide (lpAmt, lpAmtT, 1.0e-4f);
+        glide (hpAmt, hpAmtT, 1.0e-4f);
+        glide (lpLog, lpLogT, 1.0e-4f);
+        glide (hpLog, hpLogT, 1.0e-4f);
+
+        if (exactly (lpAmt, 0.0f)) for (auto& f : lpState) f = {};
+        if (exactly (hpAmt, 0.0f)) for (auto& f : hpState) f = {};
+        return lpAmt > 0.0f || hpAmt > 0.0f;
+    }
+
+    float svf (SvfState& st, float x, float g, bool highPass) const noexcept
+    {
+        // Zavalishin TPT state-variable filter, Q ~ 0.8.
+        constexpr float k = 1.25f;
+        const float a1 = 1.0f / (1.0f + g * (g + k));
+        const float a2 = g * a1, a3 = g * a2;
+        const float v3 = x - st.ic2;
+        const float v1 = a1 * st.ic1 + a2 * v3;
+        const float v2 = st.ic2 + a2 * st.ic1 + a3 * v3;
+        st.ic1 = 2.0f * v1 - st.ic1;
+        st.ic2 = 2.0f * v2 - st.ic2;
+        return highPass ? x - k * v1 - v2 : v2;
+    }
+
+    float applyFilter (int c, float x) noexcept
+    {
+        const float nyq = (float) (0.45 * sr);
+        constexpr float pi = 3.14159265f;
+        float y = x;
+        if (lpAmt > 0.0f)
+        {
+            const float g = std::tan (pi * std::min (std::exp (lpLog), nyq) / (float) sr);
+            y += lpAmt * (svf (lpState[(size_t) c], x, g, false) - x);
+        }
+        if (hpAmt > 0.0f)
+        {
+            const float g = std::tan (pi * std::min (std::exp (hpLog), nyq) / (float) sr);
+            y += hpAmt * (svf (hpState[(size_t) c], x, g, true) - x);
+        }
+        return y;
+    }
+
+    //==========================================================================
     std::array<std::vector<float>, kMaxChannels> buffers;
     int channels = 2;
+    double sr = 48000.0;
     int64_t capacity = 0, mask = 0;
 
     int64_t writeCount = 0; // absolute index of the next sample to record
     Head head, fadeHead;
     int fadeLen = 0, fadeRemaining = 0;
+    bool fadeLinear = false;
 
     bool stuttering = false;
     StutterType type = StutterType::repeat;
+    float p1 = 0.0f, p2 = 0.0f, level = 1.0f, pan = 0.0f;
+    uint32_t seed = 0;
     int64_t sliceStart = 0;
-    double sliceLen = 0.0, stepLen = 0.0, gridPhase = 0.0, period = 0.0, minPeriod = 32.0;
-    int fadeSamples = 0;
+    double sliceLen = 0.0, stepLen = 0.0, gridPhase = 0.0, minPeriod = 32.0;
+    double regionStart = 0.0, oldestNeeded = 0.0;
+    int fadeSamples = 0, slicesPerStep = 1, maxLookbackSlices = 0;
     int64_t elapsed = 0, repeatIndex = 0, nextWrap = 0;
     double nextWrapT = 0.0;
 
-    float gateGain = 1.0f, gateStep = 1.0f;
+    float gateGain = 1.0f, gateUp = 1.0f, gateDown = 1.0f;
+
+    float lpAmt = 0.0f, hpAmt = 0.0f, lpAmtT = 0.0f, hpAmtT = 0.0f;
+    float lpLog = 0.0f, hpLog = 0.0f, lpLogT = 0.0f, hpLogT = 0.0f;
+    float filterSmooth = 0.99f;
+    std::array<SvfState, kMaxChannels> lpState {}, hpState {};
 
     float mixTarget = 1.0f, mixCurrent = 1.0f, mixStep = 0.0f;
     int mixRampLeft = 0, mixSmoothingSamples = 960;
