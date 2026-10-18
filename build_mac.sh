@@ -1,41 +1,28 @@
-#!/usr/bin/env bash
-# Glitch Nasty - build & install on macOS (universal: Apple Silicon + Intel).
-#
-#   bash build_mac.sh                  # downloads JUCE 8.0.15 into ./JUCE the first time
-#   bash build_mac.sh ~/path/to/JUCE   # or use your own JUCE 8.x checkout
-#
-# Needs: Xcode command line tools (xcode-select --install) and CMake (brew install cmake).
+#!/bin/bash
+# Build Glitch Nasty (AU + VST3 + Standalone) on macOS, install the plug-ins and run the engine tests.
+#   bash build_mac.sh                 -> downloads JUCE 8.0.15 automatically
+#   bash build_mac.sh /path/to/JUCE   -> uses your own JUCE checkout instead
 set -euo pipefail
-
 cd "$(dirname "$0")"
-JUCE_VERSION="8.0.15"
 
-if [[ $# -ge 1 ]]; then
-    JUCE_DIR="$(cd "$1" && pwd)"
-else
-    JUCE_DIR="$(pwd)/JUCE"
-    if [[ ! -d "$JUCE_DIR" ]]; then
-        echo "==> Downloading JUCE $JUCE_VERSION"
-        git clone --depth 1 --branch "$JUCE_VERSION" https://github.com/juce-framework/JUCE.git "$JUCE_DIR"
-    fi
-fi
+command -v cmake >/dev/null || { echo "CMake not found. Install it with:  brew install cmake"; exit 1; }
+xcode-select -p >/dev/null 2>&1 || { echo "Xcode command line tools missing. Run:  xcode-select --install"; exit 1; }
 
-echo "==> Configuring"
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
-      -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-      -DJUCE_DIR="$JUCE_DIR"
+JUCE_ARG=()
+if [ $# -ge 1 ]; then JUCE_ARG=(-DJUCE_DIR="$1"); fi
 
-echo "==> Building"
-cmake --build build --config Release --parallel "$(sysctl -n hw.ncpu)"
+# Plain Makefiles: works with just the command line tools (no full Xcode needed)
+cmake -B build-mac -DCMAKE_BUILD_TYPE=Release "${JUCE_ARG[@]+"${JUCE_ARG[@]}"}"
+cmake --build build-mac --config Release --target GlitchNasty_AU GlitchNasty_VST3 GlitchNasty_Standalone GlitchNastyTests -j "$(sysctl -n hw.ncpu)"
 
-echo "==> Running engine tests"
-./build/GlitchNastyTests
+echo "Running engine tests..."
+./build-mac/GlitchNastyTests
 
-cat <<EOF
+# COPY_PLUGIN_AFTER_BUILD already installed them; make sure Logic/GarageBand see the new AU right away
+killall -9 AudioComponentRegistrar 2>/dev/null || true
 
-Done. Installed to ~/Library/Audio/Plug-Ins/ (AU in Components, VST3 in VST3).
-Standalone app: build/GlitchNasty_artefacts/Release/Standalone/Glitch Nasty.app
-Rescan in your DAW and look for Norka DSP > Glitch Nasty.
-Logic AU check:  auval -v aumf Gnst Nrka
-EOF
+echo
+echo "Installed:"
+ls -d ~/Library/Audio/Plug-Ins/Components/"Glitch Nasty.component" ~/Library/Audio/Plug-Ins/VST3/"Glitch Nasty.vst3" 2>/dev/null || true
+echo "Standalone app: $(pwd)/build-mac/GlitchNasty_artefacts/Release/Standalone/Glitch Nasty.app"
+echo "Rescan plug-ins in your DAW and look for Norka DSP > Glitch Nasty.  (Logic: auval -v aumf Gnst Nrka)"

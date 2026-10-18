@@ -4,10 +4,16 @@ A tempo-synced, real-time glitch/stutter plug-in. Zero latency, so it works on a
 **Phase 1:** clock, step pattern with per-step chance, stutter engine. Coming next: the crusher (bits / sample rate),
 glitch modifiers (reverse, gate, varispeed, tape stop), the delay/reverb send, then the step sequencer for bits/SR/pitch.
 
-## Build and install (Mac)
+## Install (easiest)
+
+Download **GlitchNasty-Installer.pkg** from the latest release: https://github.com/Harencorey/glitch-nasty/releases/tag/latest
+It isn't Apple-notarized yet, so the first time macOS blocks it: **System Settings > Privacy & Security > Open Anyway**
+(or right-click the .pkg and choose **Open**). The Standalone app is **GlitchNasty-Standalone.app.zip** on the same page.
+Every past version stays downloadable at https://github.com/Harencorey/glitch-nasty/releases.
+
+## Build it yourself (Mac)
 
 ```bash
-cd GlitchNasty
 bash build_mac.sh                   # downloads JUCE 8.0.15 automatically
 # or: bash build_mac.sh ~/path/to/JUCE
 ```
@@ -16,7 +22,14 @@ Needs the Xcode command line tools and CMake (`brew install cmake`). It builds a
 installs the plug-ins into `~/Library/Audio/Plug-Ins/`, and runs the engine tests. Look for **Norka DSP > Glitch Nasty**.
 Logic: `auval -v aumf Gnst Nrka`. It's a *music effect* (`aumf`), not `aufx`, because MIDI input is reserved for MIDI-triggered glitches later.
 
-**Standalone / live:** the app is in `build/GlitchNasty_artefacts/Release/Standalone/`.
+## Automated builds
+
+Every push to `main` builds on a GitHub macOS runner (`.github/workflows/build-mac.yml`) as version `0.1.<build number>`,
+the same pipeline as Glow: engine tests, universal-binary check, **GlitchNasty-Installer.pkg** (`packaging/make_pkg.sh`),
+a test install, Apple `auval` and pluginval at strictness 10. Then it publishes the **latest** release plus a permanent
+**v0.1.<build>** release with that commit's notes. The build number shows top-right in the plug-in window.
+
+**Standalone / live:** from the release zip, or `build-mac/GlitchNasty_artefacts/Release/Standalone/` if you built it.
 - The first time, macOS asks for microphone access. Say yes, or the input is silent.
 - JUCE's standalone starts with **input muted** (the yellow bar) to stop laptop-mic feedback. Click **Settings…**, pick your interface, and untick mute. It remembers.
 - Keep the buffer at 64–128 samples for playing live. The plug-in adds no latency of its own.

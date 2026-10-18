@@ -1,3 +1,5 @@
 build/
+build-mac/
 JUCE/
 .DS_Store
+out/

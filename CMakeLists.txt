@@ -1,20 +1,26 @@
 cmake_minimum_required(VERSION 3.22)
-
-# Build number from CI (0.1.<build>), same scheme as Glow.
-set(GN_BUILD_NUMBER "0" CACHE STRING "Build number for the version string")
-project(GlitchNasty VERSION 0.1.${GN_BUILD_NUMBER} LANGUAGES C CXX)
+if(NOT DEFINED GN_VERSION)
+    set(GN_VERSION 0.1.0)   # CI passes 0.1.<build number>
+endif()
+project(GlitchNasty VERSION ${GN_VERSION} LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)  # universal binary
+endif()
 
 option(GN_BUILD_TESTS "Build the offline engine tests" ON)
 
-# ---- JUCE ---------------------------------------------------------------------
-# build_mac.sh passes -DJUCE_DIR=<path to a JUCE 8.x checkout>.
-if(NOT DEFINED JUCE_DIR)
-    message(FATAL_ERROR "Set JUCE_DIR to a JUCE 8 checkout (build_mac.sh does this for you).")
+# JUCE: use a local checkout if you pass -DJUCE_DIR=/path/to/JUCE, otherwise download 8.0.15.
+if(JUCE_DIR)
+    add_subdirectory(${JUCE_DIR} ${CMAKE_BINARY_DIR}/JUCE)
+else()
+    include(FetchContent)
+    FetchContent_Declare(JUCE GIT_REPOSITORY https://github.com/juce-framework/JUCE.git GIT_TAG 8.0.15 GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(JUCE)
 endif()
-add_subdirectory(${JUCE_DIR} ${CMAKE_BINARY_DIR}/JUCE)
 
 if(APPLE)
     set(GN_FORMATS AU VST3 Standalone)
