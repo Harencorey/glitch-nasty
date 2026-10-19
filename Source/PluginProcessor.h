@@ -56,6 +56,12 @@ public:
     // step's settings with it. Steps it covers are kept (they come back when it shrinks).
     void setStepSpan (int pattern, int lane, int oldStart, int newStart, int newEnd);
 
+    // Lanes: each pattern has 1..gn::kMaxLanes. Adding appends an empty lane;
+    // removing deletes that lane (its steps and locks) and moves the ones below up.
+    int getNumLanes (int pattern) const;
+    void addLane (int pattern);
+    void removeLane (int pattern, int lane);
+
     // Parameter locks: value 0..1, or gn::kModUnset to clear.
     float getMod (int pattern, int lane, int target, int step) const;
     void setMod (int pattern, int lane, int target, int step, float value);
@@ -71,8 +77,8 @@ public:
     void randomizePattern (int pattern, int lane, const RandomLocks& locks);
 
     // Editor state (message thread; saved with the session so the editor reopens as you left it).
-    int getActiveLane() const noexcept { return activeLane; }
-    void setActiveLane (int lane) noexcept { activeLane = juce::jlimit (0, gn::kNumLanes - 1, lane); }
+    int getActiveLane() const;   // clamped to the edited pattern's lanes
+    void setActiveLane (int lane) noexcept { activeLane = juce::jlimit (0, gn::kMaxLanes - 1, lane); }
     int getBarsTarget() const noexcept { return barsTarget; }          // -1 = Chance, else a gn::ModTarget
     void setBarsTarget (int t) noexcept { barsTarget = juce::jlimit (-1, gn::kNumModTargets - 1, t); }
 
@@ -80,13 +86,15 @@ public:
     juce::AudioProcessorValueTreeState apvts;
 
     // UI -> audio thread: TAP asks to snap the internal clock to the nearest beat;
-    // a held live pad (type index, or -1).
+    // a held live pad (type index, or -1); latched live pads (bit = type).
     std::atomic<bool> snapRequest { false };
     std::atomic<int> livePad { -1 };
+    std::atomic<uint32_t> liveLatch { 0 };
 
     // Audio thread -> UI (read on a timer, never blocks either side).
-    std::atomic<int> uiPlayingStep { -1 }, uiLiveType { -1 }, uiPattern { 0 };
-    std::array<std::atomic<int>, gn::kNumLanes> uiFiringStep { -1, -1 }, uiFiringLen { 1, 1 };
+    std::atomic<int> uiPlayingStep { -1 }, uiPattern { 0 };
+    std::atomic<uint32_t> uiLiveMask { 0 }; // live types playing right now (bit = type)
+    std::array<std::atomic<int>, gn::kMaxLanes> uiFiringStep { -1, -1, -1, -1 }, uiFiringLen { 1, 1, 1, 1 };
     std::atomic<bool> uiEngaged { true }, uiEngagePending { false }, uiHostClock { false };
     std::atomic<float> uiBpm { 120.0f };
 

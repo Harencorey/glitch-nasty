@@ -3,6 +3,10 @@
 // Glitch Nasty - live panel: hold a pad to glitch right now (overrides the
 // pattern), plus the live repeat length and quantize. The same thing works
 // from MIDI notes (C3 upward), so a pad controller or keyboard can play it.
+//   Shift-click        latch a pad on (hands free, so you can tweak its knobs);
+//                      Shift-click it again to let go
+//   Shift+Cmd-click    add / remove pads to a stack: up to 4 latched at once,
+//                      each one processing the one before it
 //==============================================================================
 
 #include "PluginProcessor.h"
@@ -24,7 +28,7 @@ public:
 private:
     GlitchNastyProcessor& processor;
     const int type;
-    bool pressed = false;
+    bool pressed = false; // held down as a momentary pad (not a latch click)
 };
 
 class LivePanel : public juce::Component,
@@ -47,7 +51,7 @@ private:
     juce::ComboBox repeatBox, quantBox;
     juce::Label repeatLabel, quantLabel;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> repeatAttachment, quantAttachment;
-    int shownLive = -2;
+    uint32_t shownLive = 0xffffffffu, shownLatch = 0xffffffffu;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LivePanel)
 };

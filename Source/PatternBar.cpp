@@ -23,22 +23,6 @@ PatternBar::PatternBar (GlitchNastyProcessor& p) : processor (p)
         addAndMakeVisible (t);
     }
 
-    for (int l = 0; l < gn::kNumLanes; ++l)
-    {
-        auto& t = laneTabs[(size_t) l];
-        t.setButtonText ("LANE " + juce::String (l + 1));
-        t.setClickingTogglesState (false);
-        t.setColour (juce::TextButton::buttonOnColourId, l == 0 ? acid : lane2);
-        t.setColour (juce::TextButton::textColourOnId, background);
-        t.setColour (juce::TextButton::textColourOffId, l == 0 ? acid : lane2);
-        t.setTooltip (l == 0 ? "Edit lane 1, the main sequence (or click its row on the grid)."
-                             : "Edit lane 2: a second sequence that glitches lane 1's output, so its glitches stack on top "
-                               "(or click its row on the grid).");
-        t.setConnectedEdges (l == 0 ? juce::Button::ConnectedOnRight : juce::Button::ConnectedOnLeft);
-        t.onClick = [this, l] { processor.setActiveLane (l); };
-        addAndMakeVisible (t);
-    }
-
     barsBox.addItem ("Chance", 1);
     barsBox.addSeparator();
     barsBox.addSectionHeading ("Locks (per step)");
@@ -123,12 +107,6 @@ void PatternBar::timerCallback()
         shownPlaying = playing;
         repaint();
     }
-    if (processor.getActiveLane() != shownLane)
-    {
-        shownLane = processor.getActiveLane();
-        for (int l = 0; l < gn::kNumLanes; ++l)
-            laneTabs[(size_t) l].setToggleState (l == shownLane, juce::dontSendNotification);
-    }
     if (processor.getBarsTarget() != shownBars)
     {
         shownBars = processor.getBarsTarget();
@@ -161,11 +139,7 @@ void PatternBar::resized()
     for (auto& t : tabs)
         t.setBounds (r.removeFromLeft (28));
 
-    r.removeFromLeft (14);
-    for (auto& t : laneTabs)
-        t.setBounds (r.removeFromLeft (62));
-
-    r.removeFromLeft (46);
+    r.removeFromLeft (60);
     barsBox.setBounds (r.removeFromLeft (100).reduced (0, 1));
 
     // Tools on the right.

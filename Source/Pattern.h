@@ -180,10 +180,11 @@ struct StepData
 };
 
 //==============================================================================
-// Two lanes per pattern. Lane 2 runs in series after lane 1: its glitches
-// process whatever lane 1 puts out, so they stack (a Roll on lane 2 over a
-// Pitch tie on lane 1 rolls the pitched sound).
-constexpr int kNumLanes = 2;
+// Up to four lanes per pattern (each pattern shows as many as you add). The
+// lanes run in series: lane 2 glitches whatever lane 1 puts out, lane 3 what
+// lane 2 puts out, and so on - so they stack (a Roll on lane 2 over a Pitch tie
+// on lane 1 rolls the pitched sound).
+constexpr int kMaxLanes = 4;
 
 // Parameter locks: per step, a lane can override one of these for whatever
 // glitch is playing on that step - even in the middle of a tie.
@@ -246,7 +247,8 @@ struct Lane
 
 struct Pattern
 {
-    std::array<Lane, kNumLanes> lanes {};
+    std::array<Lane, kMaxLanes> lanes {};
+    int numLanes = 1; // how many lanes this pattern uses (1..kMaxLanes)
 
     // Shorthand for lane 1 (most code and the tests think in lane 1).
     StepData& operator[] (size_t i) noexcept             { return lanes[0].steps[i]; }
@@ -343,6 +345,7 @@ inline PatternBank makeDefaultBank()
     E[0].p2 = 1.0f;  // glide +24
     E[8] = makeStep (T::pitch, kDiv32, 1.0f, 8);
     E[8].p2 = 0.0f;  // glide -24
+    E.numLanes = 2;
     E.lanes[1].steps[4] = makeStep (T::roll, kDiv32, 1.0f, 2);   // lane 2: rolls the rising pitch
     E.lanes[1].steps[12] = makeStep (T::reverse, kDiv64);        // lane 2: reverses the falling pitch
 

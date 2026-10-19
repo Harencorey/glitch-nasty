@@ -3,19 +3,32 @@
 LivePad::LivePad (GlitchNastyProcessor& p, int t) : processor (p), type (t)
 {
     setTooltip ("Hold to " + juce::String (gn::kTypeNames[t]).toLowerCase() + " right now (overrides the pattern). "
-                "Clicking also opens this pad's own settings in the editor on the left. "
+                "Shift-click to latch it on hands-free (Shift-click again to let go); Shift+Cmd-click to stack it with other "
+                "latched pads (up to 4, each processing the one before). Clicking also opens this pad's own settings on the left. "
                 "MIDI " + juce::MidiMessage::getMidiNoteName (gn::kLiveNoteBase + t, true, true, 3) + " plays it too.");
 }
 
 void LivePad::paint (juce::Graphics& g)
 {
     using namespace gn::colours;
-    const bool active = pressed || processor.uiLiveType.load() == type;
+    const uint32_t bit = 1u << type;
+    const bool playing = (processor.uiLiveMask.load() & bit) != 0;
+    const bool latched = (processor.liveLatch.load() & bit) != 0;
+    const bool active = pressed || playing;
     auto r = getLocalBounds().toFloat().reduced (2.0f);
-    g.setColour (active ? nasty : raised);
+    g.setColour (active ? nasty : (latched ? nasty.withAlpha (0.35f) : raised)); // latched but waiting for the quantize point = dim pink
     g.fillRoundedRectangle (r, 5.0f);
     g.setColour (selected ? acid : (active ? nasty.brighter (0.3f) : outline));
     g.drawRoundedRectangle (r, 5.0f, selected ? 2.0f : 1.0f);
+
+    if (latched) // a little latch mark top-right
+    {
+        auto mark = r.removeFromTop (14.0f).removeFromRight (40.0f).reduced (3.0f, 2.0f);
+        g.setColour (active ? background : nasty);
+        g.setFont (juce::FontOptions (8.5f, juce::Font::bold));
+        g.drawText ("LATCH", mark, juce::Justification::centredRight);
+        r = getLocalBounds().toFloat().reduced (2.0f);
+    }
 
     g.setColour (active ? background : text);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
@@ -26,17 +39,40 @@ void LivePad::paint (juce::Graphics& g)
                 juce::Justification::centred);
 }
 
-void LivePad::mouseDown (const juce::MouseEvent&)
+void LivePad::mouseDown (const juce::MouseEvent& e)
 {
-    pressed = true;
-    processor.livePad.store (type);
+    const uint32_t bit = 1u << type;
+    if (e.mods.isShiftDown())
+    {
+        auto latch = processor.liveLatch.load();
+        if (e.mods.isCommandDown())
+        {
+            // Stack: toggle this pad in the set (up to 4 at once - one per lane engine).
+            if ((latch & bit) != 0)                                          latch &= ~bit;
+            else if (juce::countNumberOfBits (latch) < gn::kMaxLanes)       latch |= bit;
+        }
+        else
+        {
+            // Latch just this pad (Shift-click it again to let go).
+            latch = latch == bit ? 0u : bit;
+        }
+        processor.liveLatch.store (latch);
+    }
+    else
+    {
+        pressed = true;
+        processor.livePad.store (type);
+    }
+
     if (onPressed)
         onPressed (type);
-    repaint();
+    getParentComponent()->repaint();
 }
 
 void LivePad::mouseUp (const juce::MouseEvent&)
 {
+    if (! pressed)
+        return; // a latch click: nothing to let go of
     pressed = false;
     int expected = type;
     processor.livePad.compare_exchange_strong (expected, -1);
@@ -92,12 +128,14 @@ void LivePanel::setSelectedPad (int type)
 
 void LivePanel::timerCallback()
 {
-    const int live = processor.uiLiveType.load();
-    if (live != shownLive)
+    const auto live = processor.uiLiveMask.load(), latch = processor.liveLatch.load();
+    if (live != shownLive || latch != shownLatch)
     {
         shownLive = live;
+        shownLatch = latch;
         for (auto& pad : pads)
             pad->repaint();
+        repaint();
     }
 }
 
@@ -116,7 +154,10 @@ void LivePanel::paint (juce::Graphics& g)
     g.drawText ("LIVE", header, juce::Justification::centredLeft);
     g.setColour (dimText);
     g.setFont (juce::FontOptions (11.5f));
-    g.drawText ("hold to glitch - click to edit its settings", header.withTrimmedLeft (48), juce::Justification::centredLeft);
+    const int latched = juce::countNumberOfBits (processor.liveLatch.load());
+    g.drawText (latched > 0 ? juce::String (latched) + (latched == 1 ? " latched" : " stacked") + " - shift-click to let go"
+                            : juce::String ("hold to glitch - shift-click latch - shift+cmd-click stack"),
+                header.withTrimmedLeft (48), juce::Justification::centredLeft);
 }
 
 void LivePanel::resized()

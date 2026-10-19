@@ -3,22 +3,15 @@
 
 namespace
 {
-constexpr float kNumberH = 20.0f;
-constexpr float kLane1H  = 36.0f;
-constexpr float kLane2H  = 30.0f;
-constexpr float kLaneGap = 4.0f;
-constexpr float kTypeH   = 22.0f;
-constexpr float kRepeatH = 22.0f;
-constexpr float kGap     = 6.0f;
+constexpr float kGutter    = 50.0f; // lane labels and + / - on the left
+constexpr float kNumberH   = 20.0f;
+constexpr float kLaneGap   = 3.0f;
+constexpr float kRepeatH   = 22.0f;
+constexpr float kGap       = 6.0f;
 constexpr float kColumnPad = 3.0f;
-constexpr float kEdgeGrab = 9.0f; // how close to a pad edge counts as grabbing it
+constexpr float kEdgeGrab  = 9.0f; // how close to a pad edge counts as grabbing it
 
-constexpr float kLane1Top = kNumberH;
-constexpr float kLane2Top = kLane1Top + kLane1H + kLaneGap;
-constexpr float kTypeTop  = kLane2Top + kLane2H + kGap;
-constexpr float kBarsTop  = kTypeTop + kTypeH + kGap;
-
-juce::Colour laneColour (int lane) { return lane == 0 ? gn::colours::acid : gn::colours::lane2; }
+using gn::colours::laneColour;
 } // namespace
 
 StepGrid::StepGrid (GlitchNastyProcessor& p) : processor (p)
@@ -44,42 +37,93 @@ void StepGrid::setLane (int l)
     if (l == lane())
         return;
     processor.setActiveLane (l);
+    if (onStepSelected)
+        onStepSelected (lane(), juce::jmax (0, selected));
     repaint();
 }
 
 //==============================================================================
+int StepGrid::numLanes() const { return processor.getNumLanes (processor.getEditPattern()); }
+
+float StepGrid::laneTop (int l) const noexcept
+{
+    float y = kNumberH;
+    for (int i = 0; i < l; ++i)
+        y += laneHeight (i) + kLaneGap;
+    return y;
+}
+
+float StepGrid::typeTop() const noexcept
+{
+    const int n = numLanes();
+    return laneTop (n - 1) + laneHeight (n - 1) + kGap;
+}
+
+float StepGrid::columnWidth() const noexcept
+{
+    return ((float) getWidth() - kGutter) / (float) gn::kMaxSteps;
+}
+
 int StepGrid::columnAt (float x) const
 {
-    const float w = (float) getWidth() / (float) gn::kMaxSteps;
-    return juce::jlimit (0, gn::kMaxSteps - 1, (int) std::floor (x / w));
+    return juce::jlimit (0, gn::kMaxSteps - 1, (int) std::floor ((x - kGutter) / columnWidth()));
 }
 
-StepGrid::Row StepGrid::rowAt (float y) const
+StepGrid::Hit StepGrid::hitAt (juce::Point<float> pos) const
 {
-    const float h = (float) getHeight();
-    if (y < kNumberH) return Row::number;
-    if (y < kLane1Top + kLane1H + kLaneGap * 0.5f) return Row::lane1;
-    if (y < kLane2Top + kLane2H + kGap * 0.5f) return Row::lane2;
-    if (y >= kTypeTop && y < kTypeTop + kTypeH) return Row::type;
-    if (y >= h - kRepeatH) return Row::repeat;
-    if (y >= kBarsTop && y < h - kRepeatH - kGap) return Row::bars;
-    return Row::none;
+    if (pos.x < kGutter)
+        return {};
+    const float y = pos.y, h = (float) getHeight();
+    if (y < kNumberH) return { Row::number, -1 };
+    const int n = numLanes();
+    for (int l = 0; l < n; ++l)
+        if (y < laneTop (l) + laneHeight (l) + (l == n - 1 ? kGap : kLaneGap) * 0.5f)
+            return { Row::lane, l };
+    if (y >= typeTop() && y < typeTop() + 22.0f) return { Row::type, -1 };
+    if (y >= h - kRepeatH) return { Row::repeat, -1 };
+    if (y >= barsTop() && y < h - kRepeatH - kGap) return { Row::bars, -1 };
+    return {};
 }
 
-juce::Rectangle<float> StepGrid::cell (int column, Row row) const
+juce::Rectangle<float> StepGrid::plusBounds() const
 {
-    const float w = (float) getWidth() / (float) gn::kMaxSteps;
-    const float x = (float) column * w + kColumnPad;
+    return { 3.0f, typeTop(), (kGutter - 10.0f) * 0.5f, 22.0f };
+}
+
+juce::Rectangle<float> StepGrid::minusBounds() const
+{
+    return plusBounds().translated (plusBounds().getWidth() + 4.0f, 0.0f);
+}
+
+StepGrid::GutterHit StepGrid::gutterAt (juce::Point<float> pos, int& laneOut) const
+{
+    laneOut = -1;
+    if (pos.x >= kGutter)
+        return GutterHit::none;
+    if (plusBounds().expanded (1.0f).contains (pos))  return GutterHit::plus;
+    if (minusBounds().expanded (1.0f).contains (pos)) return GutterHit::minus;
+    for (int l = 0; l < numLanes(); ++l)
+        if (pos.y >= laneTop (l) && pos.y < laneTop (l) + laneHeight (l))
+        {
+            laneOut = l;
+            return GutterHit::laneLabel;
+        }
+    return GutterHit::none;
+}
+
+juce::Rectangle<float> StepGrid::cell (int column, Row row, int ln) const
+{
+    const float w = columnWidth();
+    const float x = kGutter + (float) column * w + kColumnPad;
     const float cw = w - 2.0f * kColumnPad;
     const float h = (float) getHeight();
 
     switch (row)
     {
         case Row::number: return { x, 0.0f, cw, kNumberH };
-        case Row::lane1:  return { x, kLane1Top, cw, kLane1H };
-        case Row::lane2:  return { x, kLane2Top, cw, kLane2H };
-        case Row::type:   return { x, kTypeTop, cw, kTypeH };
-        case Row::bars:   return { x, kBarsTop, cw, h - kBarsTop - kRepeatH - kGap };
+        case Row::lane:   return { x, laneTop (ln), cw, laneHeight (ln) };
+        case Row::type:   return { x, typeTop(), cw, 22.0f };
+        case Row::bars:   return { x, barsTop(), cw, h - barsTop() - kRepeatH - kGap };
         case Row::repeat: return { x, h - kRepeatH, cw, kRepeatH };
         case Row::none:   break;
     }
@@ -88,13 +132,13 @@ juce::Rectangle<float> StepGrid::cell (int column, Row row) const
 
 juce::Rectangle<float> StepGrid::columnBounds (int column) const
 {
-    const float w = (float) getWidth() / (float) gn::kMaxSteps;
-    return { (float) column * w + 1.0f, 0.0f, w - 2.0f, (float) getHeight() };
+    const float w = columnWidth();
+    return { kGutter + (float) column * w + 1.0f, 0.0f, w - 2.0f, (float) getHeight() };
 }
 
 juce::Rectangle<float> StepGrid::spanBounds (int ln, int start, int span) const
 {
-    return cell (start, padRow (ln)).withRight (cell (start + span - 1, padRow (ln)).getRight());
+    return cell (start, Row::lane, ln).withRight (cell (start + span - 1, Row::lane, ln).getRight());
 }
 
 int StepGrid::spanOf (const gn::Steps& steps, int owner, int numSteps)
@@ -123,10 +167,11 @@ std::array<int, gn::kMaxSteps> StepGrid::coverOwners (const gn::Steps& steps, in
 
 StepGrid::Edge StepGrid::edgeAt (juce::Point<float> pos) const
 {
-    const int ln = laneOf (rowAt (pos.y));
-    if (ln < 0)
+    const auto hit = hitAt (pos);
+    if (hit.row != Row::lane)
         return {};
 
+    const int ln = hit.lane;
     const auto pat = processor.getPattern (processor.getEditPattern());
     const auto& steps = pat.lanes[(size_t) ln].steps;
     const int n = processor.getNumSteps();
@@ -157,20 +202,48 @@ void StepGrid::drawBracket (juce::Graphics& g, juce::Rectangle<float> pad, bool 
 }
 
 //==============================================================================
-void StepGrid::paintLaneRow (juce::Graphics& g, const gn::Pattern& pattern, int ln, int active, int playing, bool showPlayhead, bool live)
+void StepGrid::paintGutter (juce::Graphics& g, int lanes)
+{
+    using namespace gn::colours;
+    for (int l = 0; l < lanes; ++l)
+    {
+        auto r = juce::Rectangle<float> (3.0f, laneTop (l), kGutter - 8.0f, laneHeight (l));
+        const bool editing = l == lane();
+        g.setColour (laneColour (l).withAlpha (editing ? 0.9f : 0.15f));
+        g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (editing ? background : laneColour (l));
+        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+        g.drawText ("L" + juce::String (l + 1), r, juce::Justification::centred);
+    }
+
+    auto button = [&g] (juce::Rectangle<float> r, const juce::String& t, bool enabled)
+    {
+        g.setColour (raised.withAlpha (enabled ? 1.0f : 0.4f));
+        g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (outline);
+        g.drawRoundedRectangle (r, 4.0f, 1.0f);
+        g.setColour ((enabled ? text : dimText).withAlpha (enabled ? 1.0f : 0.5f));
+        g.setFont (juce::FontOptions (15.0f, juce::Font::bold));
+        g.drawText (t, r, juce::Justification::centred);
+    };
+    button (plusBounds(), "+", lanes < gn::kMaxLanes);
+    button (minusBounds(), "-", lanes > 1);
+}
+
+void StepGrid::paintLaneRow (juce::Graphics& g, const gn::Pattern& pattern, int ln, int active, int playing, bool showPlayhead)
 {
     using namespace gn::colours;
     const auto& steps = pattern.lanes[(size_t) ln].steps;
     const auto owner = coverOwners (steps, active);
     const bool editing = ln == lane();
-    const int firing = (showPlayhead && ! (live && ln == 0)) ? processor.uiFiringStep[(size_t) ln].load() : -1;
+    const bool live = processor.uiLiveMask.load() != 0;
+    const int firing = (showPlayhead && ! live) ? processor.uiFiringStep[(size_t) ln].load() : -1;
     const int firingLen = processor.uiFiringLen[(size_t) ln].load();
-    const auto row = padRow (ln);
     const auto colour = laneColour (ln);
 
     // The lane being edited gets a frame, so it's obvious which one the rows below show.
     {
-        auto band = cell (0, row).withRight (cell (gn::kMaxSteps - 1, row).getRight()).expanded (2.0f, 2.0f);
+        auto band = cell (0, Row::lane, ln).withRight (cell (gn::kMaxSteps - 1, Row::lane, ln).getRight()).expanded (2.0f, 1.5f);
         g.setColour (colour.withAlpha (editing ? 0.10f : 0.03f));
         g.fillRoundedRectangle (band, 5.0f);
         if (editing)
@@ -210,17 +283,11 @@ void StepGrid::paintLaneRow (juce::Graphics& g, const gn::Pattern& pattern, int 
             if (span > 1) label << "  " << span << " STEPS";
             g.drawText (label, pad.reduced (12.0f, 0.0f), span > 1 ? juce::Justification::centredLeft : juce::Justification::centred);
         }
-        else if (i == 0)
-        {
-            g.setColour (colour.withAlpha (0.45f * alpha));
-            g.setFont (juce::FontOptions (9.5f, juce::Font::bold));
-            g.drawText ("LANE " + juce::String (ln + 1), pad, juce::Justification::centred);
-        }
 
         // The playhead's position inside a firing tie.
         if (inFiring && playing >= i && playing < i + firingLen)
         {
-            auto tick = cell (playing, row).removeFromBottom (3.0f).reduced (4.0f, 0.0f);
+            auto tick = cell (playing, Row::lane, ln).removeFromBottom (3.0f).reduced (4.0f, 0.0f);
             g.setColour (background.withAlpha (0.8f));
             g.fillRect (tick);
         }
@@ -342,8 +409,9 @@ void StepGrid::paint (juce::Graphics& g)
     using namespace gn::colours;
     const int pat = processor.getEditPattern();
     const auto pattern = processor.getPattern (pat);
+    const int lanes = juce::jlimit (1, gn::kMaxLanes, pattern.numLanes);
     const int active = processor.getNumSteps();
-    const bool live = processor.uiLiveType.load() >= 0;
+    const bool live = processor.uiLiveMask.load() != 0;
     const bool showPlayhead = processor.uiPattern.load() == pat;
     const int playing = showPlayhead ? processor.uiPlayingStep.load() : -1;
     const int ln = lane();
@@ -359,9 +427,11 @@ void StepGrid::paint (juce::Graphics& g)
         g.drawRoundedRectangle (sel.reduced (0.5f), 5.0f, 1.2f);
     }
 
+    paintGutter (g, lanes);
+
     // Is anything glitching on the playhead's column?
     bool glitching = live;
-    for (int l = 0; l < gn::kNumLanes && showPlayhead; ++l)
+    for (int l = 0; l < lanes && showPlayhead; ++l)
     {
         const int f = processor.uiFiringStep[(size_t) l].load();
         glitching |= f >= 0 && playing >= f && playing < f + processor.uiFiringLen[(size_t) l].load();
@@ -381,8 +451,8 @@ void StepGrid::paint (juce::Graphics& g)
         g.drawText (juce::String (i + 1), num, juce::Justification::centred);
     }
 
-    for (int l = 0; l < gn::kNumLanes; ++l)
-        paintLaneRow (g, pattern, l, active, playing, showPlayhead, live);
+    for (int l = 0; l < lanes; ++l)
+        paintLaneRow (g, pattern, l, active, playing, showPlayhead);
 
     for (int i = 0; i < gn::kMaxSteps; ++i)
     {
@@ -421,9 +491,9 @@ void StepGrid::paint (juce::Graphics& g)
 
     // Beat dividers every 4 steps
     g.setColour (outline);
-    const float w = (float) getWidth() / (float) gn::kMaxSteps;
+    const float w = columnWidth();
     for (int i = 4; i < gn::kMaxSteps; i += 4)
-        g.drawVerticalLine (juce::roundToInt ((float) i * w), kTypeTop, (float) getHeight());
+        g.drawVerticalLine (juce::roundToInt (kGutter + (float) i * w), typeTop(), (float) getHeight());
 }
 
 //==============================================================================
@@ -435,7 +505,10 @@ void StepGrid::mouseMove (const juce::MouseEvent& e)
         hoverEdge = edge;
         repaint();
     }
-    setMouseCursor (edge.owner >= 0 ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+    int gl = -1;
+    const bool clicky = gutterAt (e.position, gl) != GutterHit::none;
+    setMouseCursor (edge.owner >= 0 ? juce::MouseCursor::LeftRightResizeCursor
+                                    : (clicky ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor));
 }
 
 void StepGrid::mouseExit (const juce::MouseEvent&)
@@ -475,13 +548,68 @@ void StepGrid::setBarFromY (int column, float y)
     processor.setMod (pat, lane(), target, column, value);
 }
 
+void StepGrid::removeLaneAsked()
+{
+    const int pat = processor.getEditPattern();
+    const int l = lane();
+    if (processor.getNumLanes (pat) <= 1)
+        return;
+
+    const auto lanePat = processor.getPattern (pat).lanes[(size_t) l];
+    bool used = false;
+    for (const auto& s : lanePat.steps) used |= s.on;
+    for (const auto& row : lanePat.mod)
+        for (float v : row) used |= gn::isSet (v);
+
+    if (! used)
+    {
+        processor.removeLane (pat, l);
+        setLane (processor.getActiveLane());
+        return;
+    }
+
+    juce::Component::SafePointer<StepGrid> safe (this);
+    juce::AlertWindow::showAsync (juce::MessageBoxOptions()
+                                      .withIconType (juce::MessageBoxIconType::QuestionIcon)
+                                      .withTitle ("Remove lane " + juce::String (l + 1) + "?")
+                                      .withMessage ("Its steps and locks in pattern " + juce::String (gn::kPatternNames[(size_t) pat])
+                                                    + " will be deleted.")
+                                      .withButton ("Remove")
+                                      .withButton ("Cancel")
+                                      .withAssociatedComponent (this),
+                                  [safe, pat, l] (int result)
+                                  {
+                                      if (safe == nullptr || result != 1)
+                                          return;
+                                      safe->processor.removeLane (pat, l);
+                                      if (safe->onStepSelected)
+                                          safe->onStepSelected (safe->lane(), juce::jmax (0, safe->selected));
+                                      safe->repaint();
+                                  });
+}
+
 void StepGrid::mouseDown (const juce::MouseEvent& e)
 {
     const auto pos = e.position;
-    const int col = columnAt (pos.x);
     const int pat = processor.getEditPattern();
     const int n = processor.getNumSteps();
-    const auto row = rowAt (pos.y);
+
+    // Gutter: pick a lane, add one, remove the one being edited.
+    int gl = -1;
+    switch (gutterAt (pos, gl))
+    {
+        case GutterHit::laneLabel: setLane (gl); return;
+        case GutterHit::plus:
+            processor.addLane (pat);
+            if (onStepSelected) onStepSelected (lane(), juce::jmax (0, selected));
+            repaint();
+            return;
+        case GutterHit::minus: removeLaneAsked(); return;
+        case GutterHit::none: break;
+    }
+
+    const int col = columnAt (pos.x);
+    const auto hit = hitAt (pos);
 
     // Grab a [ or ] to change how many steps the glitch lasts.
     const auto edge = edgeAt (pos);
@@ -497,26 +625,44 @@ void StepGrid::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    if (const int ln = laneOf (row); ln >= 0)
+    if (hit.row == Row::lane)
     {
+        const int ln = hit.lane;
         setLane (ln);
         const auto steps = processor.getPattern (pat).lanes[(size_t) ln].steps;
-        select (col);
-        if (gn::ownerOf (steps, col, n) != col)
+        const int o = gn::ownerOf (steps, col, n);
+        dragMode = DragMode::none;
+        dragLane = ln;
+
+        if (o != col || steps[(size_t) col].on)
         {
-            dragMode = DragMode::none; // inside a tie: just select it (drag its edges to change it)
+            // An on step (or inside its tie): a click only selects it. A double-click switches it
+            // off - unless this same double-click is what just switched it on.
+            select (col);
+            const bool switchedOnByThisClick = e.getNumberOfClicks() >= 2 && justSwitchedOnLane == ln
+                                               && (justSwitchedOnCol == o || justSwitchedOnCol == col);
+            if (e.getNumberOfClicks() >= 2 && ! switchedOnByThisClick)
+                processor.editStep (pat, ln, o, [] (gn::StepData& s) { s.on = false; });
+            if (e.getNumberOfClicks() < 2)
+                justSwitchedOnLane = justSwitchedOnCol = -1;
             return;
         }
-        paintValue = ! steps[(size_t) col].on;
+
+        // An empty pad: switch it on (and keep painting on while dragging).
+        processor.editStep (pat, ln, col, [] (gn::StepData& s) { s.on = true; });
+        justSwitchedOnLane = ln;
+        justSwitchedOnCol = col;
         dragMode = DragMode::paintPads;
-        dragLane = ln;
-        processor.editStep (pat, ln, col, [this] (gn::StepData& s) { s.on = paintValue; });
+        select (col);
         return;
     }
 
+    if (hit.row == Row::none && pos.x < kGutter)
+        return;
+
     select (col);
 
-    switch (row)
+    switch (hit.row)
     {
         case Row::bars:
             if (e.mods.isAltDown() && processor.getBarsTarget() >= 0)
@@ -529,11 +675,10 @@ void StepGrid::mouseDown (const juce::MouseEvent& e)
             break;
         case Row::type:
         case Row::repeat:
-            showChoiceMenu (col, row);
+            showChoiceMenu (col, hit.row);
             break;
         case Row::number:
-        case Row::lane1:
-        case Row::lane2:
+        case Row::lane:
         case Row::none:
             break;
     }
@@ -568,9 +713,10 @@ void StepGrid::mouseDrag (const juce::MouseEvent& e)
 
     if (dragMode == DragMode::paintPads)
     {
+        // Painting only ever switches steps on; switching off is a deliberate double-click.
         const auto steps = processor.getPattern (pat).lanes[(size_t) dragLane].steps;
-        if (gn::ownerOf (steps, col, n) == col)
-            processor.editStep (pat, dragLane, col, [this] (gn::StepData& s) { s.on = paintValue; });
+        if (gn::ownerOf (steps, col, n) == col && ! steps[(size_t) col].on)
+            processor.editStep (pat, dragLane, col, [] (gn::StepData& s) { s.on = true; });
         return;
     }
 
@@ -590,7 +736,8 @@ void StepGrid::mouseUp (const juce::MouseEvent& e)
 
 void StepGrid::mouseDoubleClick (const juce::MouseEvent& e)
 {
-    if (rowAt (e.position.y) != Row::bars)
+    // (Pads handle their double-click in mouseDown, where the click count is known.)
+    if (hitAt (e.position).row != Row::bars)
         return;
     const int col = columnAt (e.position.x);
     if (processor.getBarsTarget() < 0)
@@ -635,17 +782,26 @@ void StepGrid::showChoiceMenu (int column, Row row)
 juce::String StepGrid::getTooltip()
 {
     const auto pos = getMouseXYRelative().toFloat();
+    int gl = -1;
+    switch (gutterAt (pos, gl))
+    {
+        case GutterHit::laneLabel: return "Lane " + juce::String (gl + 1) + ": click to edit it below.";
+        case GutterHit::plus:      return "Add a lane (up to 4). Each lane glitches the output of the lanes above it, so they stack.";
+        case GutterHit::minus:     return "Remove the lane you're editing (the framed one). Asks first if it has steps or locks.";
+        case GutterHit::none:      break;
+    }
     if (edgeAt (pos).owner >= 0)
         return "Drag to make this glitch last more or fewer steps.";
 
     const int target = processor.getBarsTarget();
-    switch (rowAt (pos.y))
+    const auto hit = hitAt (pos);
+    switch (hit.row)
     {
         case Row::number: return "Click to edit this step's controls below. Lights green as the playhead passes, pink while it's glitching.";
-        case Row::lane1:  return "Lane 1: click a step on or off, drag across to paint. Drag the [ ] edges of an on step to stretch it. "
-                                 "Click anywhere on this row to edit lane 1 below.";
-        case Row::lane2:  return "Lane 2: a second sequence that glitches lane 1's output - e.g. a Roll here over a stretched Pitch on lane 1 "
-                                 "rolls the pitched sound. Steps stretch the same way. Click anywhere on this row to edit lane 2 below.";
+        case Row::lane:
+            return "Lane " + juce::String (hit.lane + 1) + (hit.lane == 0 ? " (the main sequence)" : " (glitches the output of the lanes above)")
+                   + ". Click an empty step to switch it on (drag to paint more). Click an on step to select it; "
+                     "double-click it to switch it off. Drag the [ ] edges to stretch a step.";
         case Row::type:
         {
             const int pat = processor.getEditPattern();

@@ -1,10 +1,10 @@
 # Glitch Nasty (Norka DSP)
 
 A tempo-synced, real-time glitch/stutter plug-in. Zero latency, so it works on a live guitar as well as on tracks.
-8 patterns of 16 steps on two lanes (lane 2 glitches lane 1's output), 11 glitch types each with their own controls,
+8 patterns of 16 steps on up to four stacking lanes (each lane glitches the output of the ones above it), 11 glitch types each with their own controls,
 per-step level/pan/filter/crush/send, ties, parameter locks (change any control step by step, even in the middle of a
 stretched glitch), swing, steerable randomness, a crusher, tempo-synced delay and reverb, and live triggering from pads,
-MIDI notes and a footswitch.
+MIDI notes and a footswitch - pads can be latched and stacked.
 
 Coming next: presets / A-B / undo.
 
@@ -62,23 +62,28 @@ chance, shape). Shift and reverse take the lane's parameter locks with them.
 
 Patterns are saved with the session. Sessions from 0.1.x open with their old steps in pattern A
 (their per-step automation lanes don't carry over - the steps are no longer separate parameters).
-Sessions from 0.4 open with their layers moved to lane 2, exactly where they were.
+Sessions from 0.4 open with their layers moved to lane 2, exactly where they were; 0.5 sessions open with two lanes.
 
 ## Steps
 
-**Grid:** two rows of pads - **lane 1** (green) and **lane 2** (blue). Click a pad to switch a step on/off (drag to
-paint). Clicking anywhere on a lane's row (or the **LANE 1 / LANE 2** buttons) makes it the lane you're editing: it gets
-a frame, and the type, bar and repeat rows and the step editor below all show that lane. Click the **type** or
-**repeat** box for a menu. Click a step's **number** to edit it below. Pink = glitching right now.
+**Grid:** one row of pads per lane - **L1** green, **L2** blue, **L3** violet, **L4** orange.
+- **Click an empty step** to switch it on (drag across to paint more on).
+- **Click an on step** to select it - it stays on, so you can click around while you tweak.
+- **Double-click an on step** (anywhere on a stretched one) to switch it off.
+- Clicking a lane's row, or its **L1-L4** label on the left, makes it the lane you're editing: it gets a frame, and the
+  type, bar and repeat rows and the step editor below all show that lane.
+- **+ / -** under the labels add a lane (up to 4) or remove the one you're editing (it asks first if the lane has steps
+  or locks). Each pattern keeps its own lane count.
+- Click the **type** or **repeat** box for a menu. Click a step's **number** to edit it below. Pink = glitching right now.
 
 **Length (ties):** every on step has **[ ]** brackets at its edges - drag either one (the cursor turns into a resize
 arrow) to make the glitch last more or fewer steps. Dragging the left edge moves where it starts. Works on both lanes.
 Steps a tie covers are kept, not deleted: shrink it again and they're back.
 
-**Lane 2 (stacking):** a second, independent sequence that runs *after* lane 1 and glitches whatever lane 1 puts out.
-Pitch down over 4 steps on lane 1 with a Roll on lane 2's step 3 rolls the pitched-down sound, then the pitch carries
-on. A lane 2 step can be stretched too (a 2-step Repeat keeps looping the pitched sound for both steps). With nothing
-on lane 1, lane 2 just glitches the input. Pattern **E** shows it off.
+**Lanes (stacking):** each lane is an independent sequence that runs *after* the lanes above it and glitches whatever
+they put out. Pitch down over 4 steps on lane 1 with a Roll on lane 2's step 3 rolls the pitched-down sound, then the
+pitch carries on; add a Reverse on lane 3 and it reverses the rolled, pitched sound. Steps on any lane can be stretched.
+With nothing playing above it, a lane just glitches the input. Pattern **E** shows it off.
 
 **Bars (chance and parameter locks):** the **BARS** menu picks what the bar row draws for the lane you're editing.
 - **Chance:** how often each step fires (drag; drag sideways to draw across steps; double-click = 100 %).
@@ -113,6 +118,13 @@ The header shows how many repeats fit in the step: Roll, Fade, Ping-Pong decay a
 ## Live
 
 Hold a **pad** (or play a **MIDI note**) to glitch right now with that type - it overrides the pattern until you let go.
+- **Shift-click** a pad to **latch** it on hands-free (marked LATCH), so you can turn its knobs while it plays.
+  Shift-click it again to let go.
+- **Shift+Cmd-click** pads to **stack** them: up to 4 latched at once, each processing the one before it (e.g. Repeat
+  then Gate = a gated stutter). Shift+Cmd-click a stacked pad to take it out. A held pad or MIDI note plays on top of
+  the stack.
+- A latched pad waiting for its Quantize point shows dim pink.
+
 **Repeat** sets the slice length; **Quantize** sets when it starts (Off = instantly, or on the next 1/16, 1/8, 1/4 or bar).
 Each pad has **its own settings**: clicking a pad opens them in the step editor (outlined pink), so you can set, say,
 the Pitch pad to -7 st with a high-pass and half send. Click a step number to go back to editing the pattern.
@@ -133,9 +145,14 @@ Pad settings are saved with the session.
 | **Reverb** | **Size** (room → huge hall, about 0.4–9 s), **Damp** (bright → dark), **Mix** (0 = off). An 8-line feedback delay network. |
 | **Send / Feed** | **Glitches**: only the glitched audio (times each step's Send) feeds the delay and reverb, so tails spill out of the glitches while the straight signal stays dry. **Everything**: the whole output. |
 
-Both crushers quantise relative to the signal's level (a peak follower with a 250 ms release), so "4 bits" is
+Both crushers quantise relative to the signal's level (a peak follower with a 120 ms release), so "4 bits" is
 4-bit crunch on a quiet guitar as much as on a loud drum bus - measured: no level drop at −6, −18 or −30 dBFS, and
-about 6 dB more crunch per bit lost.
+about 6 dB more crunch per bit lost. The quantiser has no zero step, so anything that isn't true silence comes out as
+crunch, never a drop-out.
+
+*Fixed in 0.6:* in 0.5.7 and earlier, one extreme sample from a plug-in earlier in the chain (or a very hot peak)
+pinned the step crusher's level follower, and crushed glitches went silent for up to ~20 s. The follower is now capped
+and ignores broken samples; a test plays the exact reported settings after a 1e8 sample through the real plug-in.
 
 Tails keep ringing when the transport stops. With every Mix at 0 the effects are a true bypass.
 
@@ -169,7 +186,8 @@ with that commit's notes. The version shows top-right in the plug-in window.
 - `Source/PluginProcessor.*`: JUCE wrapper, session save/load (and 0.1.x migration), pattern tools.
 - `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `FxPanel.*`, `Theme.h`: the UI.
 - `Source/Format.h`: how values read on screen (shared by the knobs and the lock bars).
-- Lane 2 runs in a second engine in series with the first (`GlitchCore.h`), so it processes lane 1's output.
+- Every lane runs in its own engine, in series (`GlitchCore.h`), so each processes the lanes above it. Latched/stacked
+  live pads borrow those same engines, one per pad.
   Locks are applied at the exact sample of each step line (`GlitchCore::onLaneStep`).
 - `tests/test_processor.cpp`: plug-in level tests on the real processor - per-step Bits/Rate set the way the UI sets
   them (mono/stereo, 44.1-96 kHz, 64-1024 sample blocks, loud and quiet, both lanes, before and during playback: no
@@ -179,4 +197,5 @@ with that commit's notes. The version shows top-right in the plug-in window.
   click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread,
   live-pad settings, knob moves during a glitch, crusher levels/hold, delay echo timing/feedback/ping-pong,
   glitch-only sends, reverb decay vs. design, FX bypass at mix 0, lane 2 over lane 1 (stretched too), and locks
-  changing a stretched glitch on exactly the right sample.
+  changing a stretched glitch on exactly the right sample, lanes 3-4 and hidden lanes, latched and stacked live pads,
+  and crushed glitches never dropping out (loud hits, quiet tails, a broken sample from upstream).

@@ -58,6 +58,8 @@ struct RunConfig
     int channels = 2;
     int fixedBlock = 0;   // 0 = random block sizes 1..1024
     std::vector<AbsMidi> midi;
+    uint32_t latch = 0;            // latched live pads (bit = type) between latchFrom and latchTo
+    size_t latchFrom = 0, latchTo = (size_t) -1;
 };
 
 // Runs the core over 'input' (mono, copied to every channel). Returns every channel.
@@ -96,7 +98,8 @@ static Buffers runAll (const std::vector<float>& input, const gn::CoreParams& pa
         for (int c = 0; c < cfg.channels; ++c)
             ptrs[c] = bufs[(size_t) c].data() + pos;
 
-        core.process (ptrs, cfg.channels, n, params, ht, bank, midiBlock.data(), nm, -1);
+        const uint32_t latch = (pos >= cfg.latchFrom && pos < cfg.latchTo) ? cfg.latch : 0u;
+        core.process (ptrs, cfg.channels, n, params, ht, bank, midiBlock.data(), nm, -1, latch);
         pos += (size_t) n;
     }
     gWatchAllocs = false;
@@ -771,6 +774,7 @@ static void testSafety()
                                 pat[(size_t) i].p1 = pp.first;
                                 pat[(size_t) i].p2 = pp.second;
                                 // lane 2 glitches the lane-1 output, offset by a step, sometimes stretched
+                                pat.numLanes = 2;
                                 auto& l2 = pat.lanes[1].steps[(size_t) i + 1];
                                 l2 = gn::makeStep ((T) ((t + 3) % gn::kNumStutterTypes), gn::kDiv32, 1.0f, len == 3 ? 2 : 1);
                                 l2.p1 = pp.second;
@@ -829,6 +833,9 @@ static void testSafety()
                 s.levelDb = (float) (i % 3) * -3.0f;
                 s.pan = (i % 2 == 0) ? 0.3f : -0.3f;
                 s.filter = (i % 3 == 0) ? -0.5f : ((i % 3 == 1) ? 0.4f : 0.0f);
+                pat.numLanes = gn::kMaxLanes;
+                if (i % 5 == 2) pat.lanes[3].steps[(size_t) i] = gn::makeStep (T::reverse, gn::kDiv64);
+                if (i % 6 == 4) pat.lanes[2].steps[(size_t) i] = gn::makeStep (T::gate, gn::kDiv32, 1.0f, 2);
                 if (i % 3 == 1) pat.lanes[1].steps[(size_t) i] = gn::makeStep ((T) ((i * 5) % gn::kNumStutterTypes), gn::kDiv32, 1.0f, i % 2 + 1);
                 pat.lanes[0].mod[(size_t) (i % gn::kNumModTargets)][(size_t) i] = (float) ((i * 37) % 100) * 0.01f;
                 pat.lanes[1].mod[(size_t) ((i + 3) % gn::kNumModTargets)][(size_t) i] = (float) ((i * 53) % 100) * 0.01f;
@@ -1056,6 +1063,50 @@ static void testFx()
         std::printf ("  Global crusher at ~1.4 bit on a -30 dBFS tone: level %+.1f dB (no drop-out); FX at mix 0 = bit-identical\n", levelDb);
     }
 
+    // Regression (0.5.7, Reaper): crushed glitches went silent. Worst cases for a level-following crusher:
+    // a loud hit right before a quiet looped slice, quiet tails, and a wild sample from upstream.
+    {
+        gn::CoreParams p;
+        std::vector<float> in (48000 * 3);
+        for (size_t n = 0; n < in.size(); ++n)
+        {
+            const double beat = std::fmod ((double) n, 24000.0);
+            in[n] = (float) ((beat < 2400.0 ? 0.9 : 0.003) * std::sin (0.07 * (double) n)); // hit, then -50 dB
+        }
+        in[30000] = 1.0e30f; // a broken sample from the plug-in before us
+        auto bankFor = [] (float bits, float rate)
+        {
+            return bankWith ([=] (gn::Pattern& pat)
+            {
+                pat[0] = gn::makeStep (T::repeat, gn::kDiv32, 1.0f, 16);
+                pat[0].p1 = 0.45f; // loop slice 15/32: the quiet part, long after the hit
+                pat[0].p2 = 0.43f;
+                pat[0].bits = bits;
+                pat[0].rate = rate;
+            });
+        };
+        const auto plain = run (in, p, bankFor (0.0f, 0.0f));
+        bool ok = true;
+        double worst = 0.0;
+        for (auto br : { std::pair<float, float> { 0.368f, 0.239f }, { 0.9f, 0.0f }, { 0.0f, 0.9f }, { 1.0f, 1.0f } })
+        {
+            const auto out = run (in, p, bankFor (br.first, br.second));
+            for (size_t w = 2400; w + 2400 <= in.size(); w += 2400) // every 50 ms
+            {
+                const double a = rms (plain, w, w + 2400), b = rms (out, w, w + 2400);
+                if (a > 1.0e-4 && a < 10.0) // (skip the window with the broken sample itself)
+                {
+                    const double d = 20.0 * std::log10 ((b + 1e-12) / a);
+                    worst = std::min (worst, d);
+                    ok &= d > -6.0 && std::isfinite (b);
+                    if (d < -6.0) std::printf ("    bits %.2f rate %.2f window %zu: %.1f dB (plain %.2g crushed %.2g)\n", (double) br.first, (double) br.second, w, d, a, b);
+                }
+            }
+        }
+        CHECK (ok, "crushed glitch dropped out (worst 50 ms window %.1f dB vs uncrushed)", worst);
+        std::printf ("  Crushed glitch after a loud hit / on quiet tails / after a broken upstream sample: worst 50 ms window %+.1f dB\n", worst);
+    }
+
     // Everything on at once: no allocations, block-size independent.
     {
         gn::CoreParams p;
@@ -1089,6 +1140,7 @@ static void testLanes()
     {
         const auto bank = bankWith ([] (gn::Pattern& pat)
         {
+            pat.numLanes = 2;
             pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
             pat.lanes[0].steps[0].p1 = 0.25f; // -12 st
             pat.lanes[1].steps[2] = gn::makeStep (T::repeat, gn::kDiv32);
@@ -1109,6 +1161,7 @@ static void testLanes()
     {
         const auto bank = bankWith ([] (gn::Pattern& pat)
         {
+            pat.numLanes = 2;
             pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
             pat.lanes[0].steps[0].p1 = 0.25f;
             pat.lanes[1].steps[2] = gn::makeStep (T::repeat, gn::kDiv32, 1.0f, 2);
@@ -1123,7 +1176,7 @@ static void testLanes()
 
     // Lane 2 on its own (lane 1 silent) glitches the dry input.
     {
-        const auto bank = bankWith ([] (gn::Pattern& pat) { pat.lanes[1].steps[1] = gn::makeStep (T::repeat, gn::kDiv32); });
+        const auto bank = bankWith ([] (gn::Pattern& pat) { pat.numLanes = 2; pat.lanes[1].steps[1] = gn::makeStep (T::repeat, gn::kDiv32); });
         const auto out = run (counterSignal (24000), p, bank);
         bool ok = true;
         for (size_t n = 0; n < 24000; ++n)
@@ -1167,6 +1220,94 @@ static void testLanes()
     }
 }
 
+//------------------------------------------------------------------------------
+// 12) Lane count, latched live pads and stacked live pads.
+static void testLatchAndStack()
+{
+    std::printf ("Lane count, latch and stack\n");
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+    p.liveQuant = 0;
+    const auto counter = counterSignal (60000);
+
+    // A pattern that has lane 2 steps but only shows 1 lane: lane 2 stays silent.
+    {
+        auto bank = bankWith ([] (gn::Pattern& pat) { pat.numLanes = 1; pat.lanes[1].steps[1] = gn::makeStep (T::repeat, gn::kDiv32); });
+        CHECK (run (counter, p, bank) == counter, "a hidden lane played");
+        bank.patterns[0].numLanes = 2;
+        CHECK (run (counter, p, bank) != counter, "lane 2 didn't play once added");
+        std::printf ("  Lanes past the pattern's lane count are silent; adding the lane brings them in\n");
+    }
+
+    // Lanes 3 and 4 stack too: Repeat on lane 3 over a Pitch tie on lane 1.
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat.numLanes = 4;
+            pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
+            pat.lanes[0].steps[0].p1 = 0.25f;
+            pat.lanes[2].steps[2] = gn::makeStep (T::repeat, gn::kDiv32);
+        });
+        const auto out = run (counterSignal (30000), p, bank);
+        auto pitched = [] (size_t n) { return n < 6000 ? (double) n : 0.5 * (double) ((n - 6000) % 6000); };
+        bool ok = true;
+        for (size_t n = 0; n < 24000; ++n)
+            ok &= std::abs ((double) out[n] - ((n >= 15000 && n < 18000) ? pitched (n - 3000) : pitched (n))) < 0.01;
+        CHECK (ok, "lane 3 didn't process lane 1");
+        std::printf ("  Lane 3 glitches lane 1's output the same way lane 2 does\n");
+    }
+
+    // Latch: Repeat latched from 10000 to 30000 behaves like a held pad (and Engage off doesn't matter).
+    {
+        RunConfig cfg;
+        cfg.latch = 1u << (int) T::repeat;
+        cfg.latchFrom = 10000;
+        cfg.latchTo = 30000;
+        cfg.fixedBlock = 500; // latch changes land on block edges
+        gn::CoreParams q = p;
+        q.liveDivision = gn::kDiv32;
+        q.engage = false;
+        const auto out = run (counter, q, gn::PatternBank {}, cfg);
+        bool ok = true;
+        for (size_t n = 0; n < 60000; ++n)
+        {
+            double expect = (double) n;
+            if (n >= 13000 && n < 30000) expect = 10000.0 + (double) ((n - 10000) % 3000);
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "latched pad");
+        std::printf ("  A latched pad plays until it's unlatched, exactly like holding it\n");
+    }
+
+    // Stack: Repeat + Gate latched together = two engines in series; letting go returns to dry.
+    {
+        gn::CoreParams q = p;
+        q.liveDivision = gn::kDiv32;
+        gn::PatternBank bank;
+        bank.live = gn::makeDefaultBank().live;
+        RunConfig one; one.fixedBlock = 500; one.latchFrom = 10000; one.latchTo = 40000;
+        RunConfig both = one, pitchOnly = one;
+        one.latch = 1u << (int) T::repeat;
+        pitchOnly.latch = 1u << (int) T::gate;
+        both.latch = one.latch | pitchOnly.latch;
+        gAllocCount = 0;
+        const auto a = run (counter, q, bank, one), b = run (counter, q, bank, pitchOnly), c = run (counter, q, bank, both);
+        bool future = false, back = true;
+        for (size_t n = 0; n < c.size(); ++n)
+        {
+            future |= c[n] > (float) n + 0.01f || ! std::isfinite (c[n]);
+            if (n >= 40000 + 1000) back &= std::abs (c[n] - (float) n) < 0.01f;
+        }
+        double diffA = 0.0, diffB = 0.0;
+        for (size_t n = 14000; n < 40000; ++n) { diffA += std::abs (c[n] - a[n]); diffB += std::abs (c[n] - b[n]); }
+        CHECK (! future, "stacked live played the future");
+        CHECK (diffA > 1000.0 && diffB > 1000.0, "stack sounds like one of its parts (%g, %g)", diffA, diffB);
+        CHECK (back, "stack didn't return to dry");
+        CHECK (gAllocCount == 0, "allocations in live stack");
+        std::printf ("  Repeat + Gate latched together stack in series (neither alone), then return to dry\n");
+    }
+}
+
 int main()
 {
     testGridAccuracy (48000.0, 120.0, 2, gn::kDiv32, 0.5,  "48k, 120 BPM, grid 1/16, repeat 1/32");
@@ -1186,6 +1327,7 @@ int main()
     testLiveControls();
     testFx();
     testLanes();
+    testLatchAndStack();
 
     std::printf (gFailures == 0 ? "\nALL TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;

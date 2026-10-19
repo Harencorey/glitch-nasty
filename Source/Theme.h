@@ -16,6 +16,19 @@ const juce::Colour dimText    { 0xff6c6f78 };
 const juce::Colour acid       { 0xffb6ff3b };
 const juce::Colour nasty      { 0xffff2e88 };
 const juce::Colour lane2      { 0xff53d7ff }; // lane 2 steps (lane 1 is acid); pink = glitching right now
+const juce::Colour lane3      { 0xffb48cff };
+const juce::Colour lane4      { 0xffffad4d };
+
+inline juce::Colour laneColour (int lane)
+{
+    switch (lane)
+    {
+        case 0:  return acid;
+        case 1:  return lane2;
+        case 2:  return lane3;
+        default: return lane4;
+    }
+}
 } // namespace gn::colours
 
 class GlitchNastyLookAndFeel : public juce::LookAndFeel_V4

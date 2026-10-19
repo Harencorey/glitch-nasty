@@ -6,10 +6,12 @@
 //   clock -> grid (with swing) -> pattern (chance, density, seed, ties,
 //            per-step parameter locks) -> lane 1 engine -> lane 2 engine
 // Lane 2 is a second, independent sequence whose glitches process lane 1's
-// output (so a Roll on lane 2 rolls whatever lane 1 is doing).
+// output (so a Roll on lane 2 rolls whatever lane 1 is doing); up to four
+// lanes run in series like that.
 // plus live performance: MIDI notes / UI pads trigger glitches (optionally
-// quantised), MIDI notes switch patterns, and a footswitch (sustain pedal)
-// engages/disengages the pattern on the next bar line.
+// quantised), pads can be latched on and several latched pads stack (each
+// gets one of the lane engines, in series), MIDI notes switch patterns, and a
+// footswitch (sustain pedal) engages/disengages the pattern on the next bar.
 //
 // Everything that happens inside a block (grid lines, MIDI, bar lines, live
 // quantise points) is processed in time order at its exact sample. The
@@ -103,10 +105,15 @@ public:
         delay.prepare (sampleRate, 6.5);
         reverb.prepare (sampleRate);
         globalCrusher.prepare (sampleRate);
-        for (auto* v : { &sendBuf, &lane2SendBuf, &delayOut, &reverbOut })
+        for (auto* v : { &sendBuf, &delayOut, &reverbOut })
             for (auto& ch : *v)
                 ch.assign ((size_t) kMaxChunk, 0.0f);
-        lane2ActBuf.assign ((size_t) kMaxChunk, 0.0f);
+        for (auto& l : lanes)
+        {
+            for (auto& ch : l.sendBuf)
+                ch.assign ((size_t) kMaxChunk, 0.0f);
+            l.actBuf.assign ((size_t) kMaxChunk, 0.0f);
+        }
         reset();
     }
 
@@ -123,8 +130,10 @@ public:
         internalPpq = 0.0;
         playingStep = -1;
         heldCount = 0;
-        liveType = pendingLive = -1;
+        liveSlots.fill (-1);
+        liveActive = livePending = false;
         lastPad = -1;
+        lastLatch = 0;
         liveChanged = false;
         patternOverride = -1;
         lastParamPattern = -1;
@@ -140,7 +149,8 @@ public:
     }
 
     void process (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host,
-                  const PatternBank& bank, const MidiEvent* midi = nullptr, int numMidi = 0, int livePad = -1) noexcept
+                  const PatternBank& bank, const MidiEvent* midi = nullptr, int numMidi = 0, int livePad = -1,
+                  uint32_t latchMask = 0) noexcept
     {
         // Process long host blocks in pieces (the output doesn't depend on how a block is split).
         const bool hostTempo = (p.syncMode == 0 && host.hasPpq && host.hasBpm);
@@ -162,14 +172,14 @@ public:
             HostTime h = host;
             h.ppq = host.ppq + (double) done / samplesPerQ;
             float* chunk[2] = { io[0] + done, numCh > 1 ? io[1] + done : nullptr };
-            processChunk (chunk, numCh, n, p, h, bank, chunkMidi.data(), nm, livePad);
+            processChunk (chunk, numCh, n, p, h, bank, chunkMidi.data(), nm, livePad, latchMask);
             done += n;
         }
     }
 
 private:
     void processChunk (float* const* io, int numCh, int numSamples, const CoreParams& p, const HostTime& host,
-                       const PatternBank& bank, const MidiEvent* midi, int numMidi, int livePad) noexcept
+                       const PatternBank& bank, const MidiEvent* midi, int numMidi, int livePad, uint32_t latchMask) noexcept
     {
         params = &p;
         bankPtr = &bank;
@@ -227,6 +237,12 @@ private:
             lastPad = livePad;
             liveChanged = true;
         }
+        latchMask &= (1u << kNumStutterTypes) - 1u;
+        if (latchMask != lastLatch) // latched pads (Shift-click / Shift+Cmd-click)
+        {
+            lastLatch = latchMask;
+            liveChanged = true;
+        }
 
         // ---- Transport stopped: straight through ---------------------------
         if (! running)
@@ -235,7 +251,7 @@ private:
                 handleMidi (midi[m], false);
             engaged = engageTarget;
             stopAllLanes();
-            liveType = pendingLive = -1;
+            clearLive();
             stepSched.reset();
             barSched.reset();
             quantSched.reset();
@@ -262,7 +278,7 @@ private:
         if (resynced)
         {
             stopAllLanes();
-            liveType = pendingLive = -1;
+            clearLive();
             engaged = engageTarget; // starting / locating applies Engage right away
             playingStep = stepIndex (stepSched.currentStep(), p.numSteps);
             liveChanged = true;
@@ -275,11 +291,17 @@ private:
         }
 
         // Knob moves on whatever is glitching right now take effect immediately.
-        if (liveType >= 0)
-            lanes[0].engine.updateControls (controlsOf (bank.live[(size_t) liveType]));
+        if (liveActive)
+        {
+            for (int i = 0; i < kMaxLanes; ++i)
+                if (liveSlots[(size_t) i] >= 0)
+                    lanes[(size_t) i].engine.updateControls (controlsOf (bank.live[(size_t) liveSlots[(size_t) i]]));
+        }
         else
-            for (int L = 0; L < kNumLanes; ++L)
+        {
+            for (int L = 0; L < kMaxLanes; ++L)
                 refreshLaneControls (L);
+        }
 
         // ---- Walk the block in time order ----------------------------------
         // At the same sample: MIDI first, then bar lines, then steps, then
@@ -318,9 +340,17 @@ private:
 public:
     // For the UI.
     int getPlayingStep() const noexcept             { return playingStep; }
-    int getFiringStep (int lane = 0) const noexcept   { return lanes[(size_t) std::clamp (lane, 0, kNumLanes - 1)].firingStep; }
-    int getFiringLength (int lane = 0) const noexcept { return lanes[(size_t) std::clamp (lane, 0, kNumLanes - 1)].firingLen; }
-    int getLiveType() const noexcept                { return liveType; }
+    int getFiringStep (int lane = 0) const noexcept   { return lanes[(size_t) std::clamp (lane, 0, kMaxLanes - 1)].firingStep; }
+    int getFiringLength (int lane = 0) const noexcept { return lanes[(size_t) std::clamp (lane, 0, kMaxLanes - 1)].firingLen; }
+    // Bit t set = live type t is playing right now (one per stacked slot).
+    uint32_t getLiveMask() const noexcept
+    {
+        uint32_t m = 0;
+        for (int t : liveSlots)
+            if (t >= 0) m |= 1u << t;
+        return m;
+    }
+    bool isLiveActive() const noexcept              { return liveActive; }
     int getEffectivePattern() const noexcept  { return currentPatternIndex(); }
     bool isEngaged() const noexcept           { return engaged; }
     bool isEngagePending() const noexcept     { return engaged != engageTarget; }
@@ -363,7 +393,7 @@ private:
         const int numSteps = std::clamp (params->numSteps, 1, kMaxSteps);
         const int idx = stepIndex (ev.step, numSteps);
         playingStep = idx;
-        for (int L = 0; L < kNumLanes; ++L)
+        for (int L = 0; L < kMaxLanes; ++L)
             onLaneStep (L, ev, idx, numSteps);
     }
 
@@ -373,18 +403,24 @@ private:
     {
         auto& ln = lanes[(size_t) L];
 
+        if (liveActive) // live pads/notes own the engines; the pattern sits out
+        {
+            ln.tieRemaining = 0;
+            return;
+        }
+
+        if (L >= std::clamp (bankPtr->patterns[(size_t) currentPatternIndex()].numLanes, 1, kMaxLanes))
+        {
+            stopLane (L); // this pattern doesn't use the lane (any more)
+            ln.tieRemaining = 0;
+            return;
+        }
+
         if (ln.tieRemaining > 0) // still inside a tied glitch
         {
             --ln.tieRemaining;
             ln.curStep = idx;
-            if (liveType < 0)
-                refreshLaneControls (L);
-            return;
-        }
-
-        if (liveType >= 0) // live notes/pads override the pattern (lane 1 plays the pad, lane 2 rests)
-        {
-            if (L > 0) stopLane (L);
+            refreshLaneControls (L);
             return;
         }
 
@@ -476,18 +512,24 @@ private:
 
     void stopAllLanes() noexcept
     {
-        for (int L = 0; L < kNumLanes; ++L)
+        for (int L = 0; L < kMaxLanes; ++L)
         {
             stopLane (L);
             lanes[(size_t) L].tieRemaining = 0;
         }
     }
 
+    // Every lane engine runs (idle ones just keep recording, so a lane that's
+    // added later already has its history), each on the previous one's output.
     void runEngines (float* const* io, int numCh, int start, int num) noexcept
     {
         lanes[0].engine.process (io, numCh, start, num, sendPtrs());
-        float* ls[2] = { lane2SendBuf[0].data(), lane2SendBuf[1].data() };
-        lanes[1].engine.process (io, numCh, start, num, ls, lane2ActBuf.data());
+        for (int L = 1; L < kMaxLanes; ++L)
+        {
+            auto& l = lanes[(size_t) L];
+            float* ls[2] = { l.sendBuf[0].data(), l.sendBuf[1].data() };
+            l.engine.process (io, numCh, start, num, ls, l.actBuf.data());
+        }
     }
 
     void onBar() noexcept
@@ -496,16 +538,16 @@ private:
             return;
 
         engaged = engageTarget;
-        if (! engaged && liveType < 0)
+        if (! engaged && ! liveActive)
             stopAllLanes();
     }
 
     void onQuant (const GridEvent& ev) noexcept
     {
-        if (pendingLive >= 0)
+        if (livePending)
         {
-            startLive (pendingLive, ev.lateBy);
-            pendingLive = -1;
+            livePending = false;
+            applyLive (ev.lateBy);
         }
     }
 
@@ -576,36 +618,91 @@ private:
         heldCount = keep;
     }
 
-    // The most recently pressed note/pad wins; releasing it falls back to the
-    // previous one still held, and releasing everything returns to the pattern.
+    // What should be playing live: every latched pad, plus the most recently
+    // pressed held note/pad (releasing it falls back to the one held before).
+    uint32_t desiredLive() const noexcept
+    {
+        uint32_t m = lastLatch;
+        if (heldCount > 0)
+            m |= 1u << held[(size_t) heldCount - 1].type;
+        return m;
+    }
+
     void updateLive (double lateBy) noexcept
     {
-        const int desired = heldCount > 0 ? held[(size_t) heldCount - 1].type : -1;
-
-        if (desired < 0)
+        if (desiredLive() == getLiveMask() && liveActive == (desiredLive() != 0))
         {
-            pendingLive = -1;
-            if (liveType >= 0)
+            livePending = false;
+            return;
+        }
+        if (desiredLive() == 0 || std::clamp (params->liveQuant, 0, kNumQuants - 1) == 0)
+            applyLive (lateBy); // letting go is never quantised
+        else
+            livePending = true;
+    }
+
+    // Each live type gets a slot = one of the lane engines (in series, so they stack).
+    // Types already playing keep their slot and carry on undisturbed.
+    void applyLive (double lateBy) noexcept
+    {
+        const uint32_t want = desiredLive();
+        if (want == 0)
+        {
+            if (liveActive)
             {
-                liveType = -1;
-                stopAllLanes();
+                clearLive();
+                stopAllLanes(); // back to the pattern from its next step
             }
             return;
         }
 
-        if (desired == liveType)
+        if (! liveActive)
         {
-            pendingLive = -1;
-            return;
+            stopAllLanes(); // the pattern sits out while live is on
+            liveActive = true;
         }
 
-        if (std::clamp (params->liveQuant, 0, kNumQuants - 1) == 0)
-            startLive (desired, lateBy);
-        else
-            pendingLive = desired;
+        for (int i = 0; i < kMaxLanes; ++i)
+        {
+            const int t = liveSlots[(size_t) i];
+            if (t >= 0 && (want & (1u << t)) == 0)
+            {
+                stopLane (i);
+                liveSlots[(size_t) i] = -1;
+            }
+        }
+
+        // Newest held note/pad first, then latched pads in type order, while slots last.
+        int order[kNumStutterTypes + 1];
+        int n = 0;
+        if (heldCount > 0) order[n++] = held[(size_t) heldCount - 1].type;
+        for (int t = 0; t < kNumStutterTypes; ++t)
+            if ((lastLatch & (1u << t)) != 0 && (n == 0 || order[0] != t))
+                order[n++] = t;
+
+        for (int k = 0; k < n; ++k)
+        {
+            const int t = order[k];
+            bool playing = false;
+            for (int s2 : liveSlots) playing |= s2 == t;
+            if (playing)
+                continue;
+            for (int i = 0; i < kMaxLanes; ++i)
+                if (liveSlots[(size_t) i] < 0)
+                {
+                    startLive (i, t, lateBy);
+                    break;
+                }
+        }
     }
 
-    void startLive (int type, double lateBy) noexcept
+    void clearLive() noexcept
+    {
+        liveSlots.fill (-1);
+        liveActive = livePending = false;
+    }
+
+    void startLive (int slot, int type, double lateBy) noexcept
     {
         StutterSettings st;
         st.type = (StutterType) std::clamp (type, 0, kNumStutterTypes - 1);
@@ -624,11 +721,12 @@ private:
         st.rate = pad.rate;
         st.send = pad.send;
         st.seed = hash32 (seedBase ^ (0xA5A5A5A5u + ++liveCounter));
-        lanes[0].engine.startStutter (st);
-        lanes[0].firingStep = lanes[0].curStep = -1;
-        stopLane (1);
 
-        liveType = type;
+        auto& ln = lanes[(size_t) slot];
+        ln.engine.startStutter (st);
+        ln.firingStep = ln.curStep = -1;
+        ln.tieRemaining = 0;
+        liveSlots[(size_t) slot] = type;
     }
 
     static LiveControls controlsOf (const StepData& s) noexcept
@@ -685,12 +783,16 @@ private:
         if (! runDelay && ! runReverb)
             return;
 
-        // While lane 2 glitches, the effects hear its output (which already contains lane 1's glitch).
+        // While a later lane glitches, the effects hear its output (which already contains the earlier lanes' glitches).
         if (p.fxSource == 0)
-            for (int c = 0; c < numCh; ++c)
-                for (int i = 0; i < numSamples; ++i)
-                    sendBuf[(size_t) c][(size_t) i] = sendBuf[(size_t) c][(size_t) i] * (1.0f - lane2ActBuf[(size_t) i])
-                                                      + lane2SendBuf[(size_t) c][(size_t) i];
+            for (int L = 1; L < kMaxLanes; ++L)
+            {
+                const auto& l = lanes[(size_t) L];
+                for (int c = 0; c < numCh; ++c)
+                    for (int i = 0; i < numSamples; ++i)
+                        sendBuf[(size_t) c][(size_t) i] = sendBuf[(size_t) c][(size_t) i] * (1.0f - l.actBuf[(size_t) i])
+                                                          + l.sendBuf[(size_t) c][(size_t) i];
+            }
 
         const float* src[2] = { p.fxSource == 1 ? io[0] : sendBuf[0].data(),
                                 p.fxSource == 1 ? (numCh > 1 ? io[1] : io[0]) : sendBuf[1].data() };
@@ -726,16 +828,17 @@ private:
         int firingStep = -1;    // the step whose glitch is playing (-1 = none)
         int curStep = -1;       // the step the playhead is on inside it (whose locks apply)
         int firingLen = 1, firingType = -1, firingPattern = 0;
+        std::array<std::vector<float>, 2> sendBuf; // this lane's glitch audio for the FX (lane 1 uses the core's)
+        std::vector<float> actBuf;                 // how much this lane is glitching, per sample
 
         void clear() noexcept { tieRemaining = 0; firingStep = curStep = -1; firingLen = 1; firingType = -1; firingPattern = 0; }
     };
 
-    std::array<LaneState, kNumLanes> lanes;
+    std::array<LaneState, kMaxLanes> lanes;
     TempoDelay delay;
     Reverb reverb;
     Crusher globalCrusher;
-    std::array<std::vector<float>, 2> sendBuf, lane2SendBuf, delayOut, reverbOut;
-    std::vector<float> lane2ActBuf;
+    std::array<std::vector<float>, 2> sendBuf, delayOut, reverbOut;
     float* sendPtrArray[2] {};
     std::array<MidiEvent, 512> chunkMidi {};
     int channels = 2;
@@ -755,8 +858,10 @@ private:
     bool hostClock = false;
 
     int playingStep = -1;
-    int heldCount = 0, liveType = -1, pendingLive = -1, lastPad = -1;
-    bool liveChanged = false;
+    int heldCount = 0, lastPad = -1;
+    std::array<int, kMaxLanes> liveSlots { -1, -1, -1, -1 }; // live type playing on each engine (-1 = none)
+    uint32_t lastLatch = 0;
+    bool liveActive = false, livePending = false, liveChanged = false;
     int patternOverride = -1, lastParamPattern = -1;
     bool footFlip = false, footDown = false, engaged = true, engageTarget = true, engageInit = false;
 };

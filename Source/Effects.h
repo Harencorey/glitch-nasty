@@ -25,7 +25,7 @@ class Crusher
 public:
     void prepare (double sampleRate) noexcept
     {
-        envRelease = (float) std::exp (-1.0 / (0.25 * sampleRate)); // 250 ms release
+        envRelease = (float) std::exp (-1.0 / (0.12 * std::max (1000.0, sampleRate))); // 120 ms release
         reset();
     }
 
@@ -40,13 +40,21 @@ public:
     // bits = bit depth (>= 23.5 = off). Bits are continuous so a sweep is smooth.
     //
     // The quantiser follows the signal's level (a peak envelope, instant attack,
-    // 250 ms release): "4 bits" means 4 bits of the sound that's actually there,
+    // 120 ms release): "4 bits" means 4 bits of the sound that's actually there,
     // so a quiet guitar crunches like a loud drum bus instead of rounding to
     // silence - like riding the input gain of an old sampler to hit it hard.
+    // It's a mid-rise quantiser (no zero step), so anything that isn't true
+    // silence always comes out as *something* - crunch, never a drop-out.
     void processFrame (float* frame, int numCh, double factor, double bits) noexcept
     {
-        if (factor > 1.0001)
+        for (int c = 0; c < numCh; ++c)
+            if (! std::isfinite (frame[c]))
+                frame[c] = 0.0f; // never let a bad sample poison the envelope
+
+        if (factor > 1.0001 && factor < 1.0e6)
         {
+            if (! (counter >= 0.0 && counter < 2.0e9))
+                counter = 1.0e9;
             counter += 1.0;
             if (counter >= factor)
             {
@@ -64,13 +72,13 @@ public:
         float peak = 0.0f;
         for (int c = 0; c < numCh; ++c)
             peak = std::max (peak, std::abs (frame[c]));
-        env = std::max (peak, env * envRelease);
+        env = std::min (4.0f, std::max (peak, env * envRelease)); // capped: one wild sample can't mute what follows
 
-        if (bits < 23.5 && env > 1.0e-5f) // true silence stays silent
+        if (bits < 23.5 && peak > 1.0e-5f && env > 1.0e-5f) // true silence stays silent
         {
             const float q = (float) std::exp2 (std::max (1.0, bits) - 1.0) / env; // levels per unit of the current level
             for (int c = 0; c < numCh; ++c)
-                frame[c] = std::round (frame[c] * q) / q;
+                frame[c] = (std::floor (frame[c] * q) + 0.5f) / q;
         }
     }
 

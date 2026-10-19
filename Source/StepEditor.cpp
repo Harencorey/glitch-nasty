@@ -75,7 +75,7 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
 
 void StepEditor::setStep (int newLane, int column)
 {
-    lane = juce::jlimit (0, gn::kNumLanes - 1, newLane);
+    lane = juce::jlimit (0, gn::kMaxLanes - 1, newLane);
     step = juce::jlimit (0, gn::kMaxSteps - 1, column);
     liveTarget = false;
     refresh (true);
@@ -285,8 +285,8 @@ void StepEditor::paint (juce::Graphics& g)
         const int n = processor.getNumSteps();
         const int owner = gn::ownerOf (pat.lanes[(size_t) lane].steps, step, n);
         const int span = current.on ? std::max (1, std::min (current.length, n - owner)) : 1;
-        const auto laneColour = lane == 0 ? acid : gn::colours::lane2;
-        g.setColour (current.on ? laneColour : dimText);
+        const auto lc = gn::colours::laneColour (lane);
+        g.setColour (current.on ? lc : dimText);
         juce::String title = "LANE " + juce::String (lane + 1) + "  ";
         title << (span > 1 ? "STEPS " + juce::String (owner + 1) + "-" + juce::String (owner + span) : "STEP " + juce::String (owner + 1));
         title << "  " << typeName;

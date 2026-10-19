@@ -105,7 +105,9 @@ void crushAll (GlitchNastyProcessor& p, int lane, float bits, float rate)
 
 void clearAll (GlitchNastyProcessor& p)
 {
-    for (int l = 0; l < gn::kNumLanes; ++l)
+    while (p.getNumLanes (p.getEditPattern()) < 2)
+        p.addLane (p.getEditPattern());
+    for (int l = 0; l < gn::kMaxLanes; ++l)
         p.clearPattern (p.getEditPattern(), l);
 }
 
@@ -160,6 +162,8 @@ void testState()
     std::printf ("Session save / load\n");
 
     GlitchNastyProcessor a;
+    a.addLane (2);
+    a.addLane (2);
     a.editStep (2, 1, 5, [] (gn::StepData& s) { s = gn::makeStep (gn::StutterType::roll, gn::kDiv64, 0.5f, 3); s.bits = 0.4f; });
     a.setMod (2, 0, (int) gn::ModTarget::filter, 7, 0.25f);
     a.setMod (2, 1, (int) gn::ModTarget::ctl1, 6, 1.0f);
@@ -175,7 +179,7 @@ void testState()
     const auto ba = bankOf (a), bb = bankOf (b);
     bool same = true;
     for (int p = 0; p < gn::kNumPatterns; ++p)
-        for (int l = 0; l < gn::kNumLanes; ++l)
+        for (int l = 0; l < gn::kMaxLanes; ++l)
             for (int i = 0; i < gn::kMaxSteps; ++i)
             {
                 same &= sameStep (ba.patterns[(size_t) p].lanes[(size_t) l].steps[(size_t) i], bb.patterns[(size_t) p].lanes[(size_t) l].steps[(size_t) i]);
@@ -187,7 +191,8 @@ void testState()
                 }
             }
     CHECK (same, "patterns / lanes / locks didn't survive save + load");
-    CHECK (b.getActiveLane() == 1 && b.getBarsTarget() == (int) gn::ModTarget::level, "editor state didn't survive");
+    CHECK (b.getNumLanes (2) == 3 && b.getNumLanes (0) == 1 && b.getNumLanes (4) == 2, "lane counts didn't survive");
+    CHECK (b.getBarsTarget() == (int) gn::ModTarget::level, "editor state didn't survive");
     CHECK (gn::isSet (bb.patterns[7].lanes[0].mod[(size_t) gn::ModTarget::ctl1][2]), "factory pattern H lost its pitch locks");
     std::printf ("  Both lanes, every lock (incl. the factory pitch melody on H) and the editor state round-trip\n");
 
@@ -224,7 +229,8 @@ void testState()
                         && ! pat.lanes[0].steps[2].on                                         // the layer left lane 1 ...
                         && pat.lanes[1].steps[2].on && pat.lanes[1].steps[2].type == (int) gn::StutterType::roll // ... for lane 2
                         && pat.lanes[1].steps[2].length == 1
-                        && pat.lanes[0].steps[8].on && ! pat.lanes[1].steps[8].on;          // ordinary steps stay put
+                        && pat.lanes[0].steps[8].on && ! pat.lanes[1].steps[8].on           // ordinary steps stay put
+                        && pat.numLanes == 2 && c.getPattern (1).numLanes == 1;              // lane 2 shown only where it's used
         CHECK (ok, "0.4 layer didn't migrate to lane 2");
         std::printf ("  0.4 sessions: layers inside ties move to lane 2, everything else stays on lane 1\n");
     }
@@ -245,6 +251,80 @@ void testLocksThroughPlugin()
     CHECK (muted.outDb < -60.0, "level locks didn't reach the audio (%.1f dB)", muted.outDb);
     std::printf ("  Level locks drawn in the UI mute a bar-long glitch (%.0f dB)\n", muted.outDb);
 }
+//------------------------------------------------------------------------------
+// The 0.5.7 bug: one wild sample from an earlier plug-in (or a very hot peak)
+// pinned the step crusher's level follower and muted crushed glitches for seconds.
+std::vector<double> windowsDb (float bits, float rate, bool spike)
+{
+    GlitchNastyProcessor proc;
+    PlayHead ph;
+    ph.bpm = 135.0;
+    const double sr = 44100.0;
+    const int bs = 256;
+    proc.setPlayHead (&ph);
+    proc.setPlayConfigDetails (2, 2, sr, bs);
+    proc.prepareToPlay (sr, bs);
+    clearAll (proc);
+    proc.editStep (proc.getEditPattern(), 0, 0, [=] (gn::StepData& s)
+    {
+        s = gn::makeStep (gn::StutterType::repeat, gn::kDiv32, 1.0f, 16);
+        s.p1 = 0.45f;
+        s.p2 = 0.43f;
+        s.bits = bits;
+        s.rate = rate;
+    });
+
+    juce::AudioBuffer<float> buf (2, bs);
+    juce::MidiBuffer midi;
+    std::vector<double> out;
+    double acc = 0.0;
+    int count = 0;
+    const double spq = sr * 60.0 / ph.bpm;
+    for (long n = 0; n < (long) (sr * 6.0); n += bs)
+    {
+        ph.ppq = (double) n / spq;
+        for (int i = 0; i < bs; ++i)
+        {
+            const double t = (double) (n + i);
+            float x = (float) ((std::fmod (t, spq) < 2000.0 ? 0.8 : 0.01) * std::sin (0.05 * t));
+            if (spike && n + i == 20000) x = 1.0e8f; // while the glitch is still passing the live input through
+            buf.setSample (0, i, x);
+            buf.setSample (1, i, x);
+        }
+        proc.processBlock (buf, midi);
+        for (int i = 0; i < bs; ++i)
+        {
+            const double y = buf.getSample (0, i);
+            acc += std::isfinite (y) ? y * y : 1.0e30;
+            if (++count == (int) (sr * 0.1))
+            {
+                out.push_back (10.0 * std::log10 (acc / count + 1.0e-30));
+                acc = 0.0;
+                count = 0;
+            }
+        }
+    }
+    return out;
+}
+
+void testHotInput()
+{
+    std::printf ("Crushed glitches after a wild sample from upstream\n");
+    const auto plain = windowsDb (0.0f, 0.0f, true);
+    const auto crushed = windowsDb (0.368f, 0.239f, true);
+    double worst = 0.0;
+    bool ok = true;
+    for (size_t w = 5; w < plain.size(); ++w) // from just after the spike
+    {
+        if (plain[w] < -70.0 || plain[w] > 20.0)
+            continue;
+        const double d = crushed[w] - plain[w];
+        worst = std::min (worst, d);
+        ok &= d > -6.0;
+    }
+    CHECK (ok, "crushed glitches dropped out after a wild input sample (worst %.1f dB)", worst);
+    std::printf ("  8.2 bit, /2.7 (the reported settings) after a 1e8 sample: worst 100 ms window %+.1f dB vs uncrushed\n", worst);
+}
 } // namespace
 
 int main()
@@ -253,6 +333,7 @@ int main()
     testStepCrushLevel();
     testState();
     testLocksThroughPlugin();
+    testHotInput();
     std::printf (gFailures == 0 ? "\nALL PROCESSOR TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;
 }
