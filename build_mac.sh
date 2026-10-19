@@ -13,10 +13,11 @@ if [ $# -ge 1 ]; then JUCE_ARG=(-DJUCE_DIR="$1"); fi
 
 # Plain Makefiles: works with just the command line tools (no full Xcode needed)
 cmake -B build-mac -DCMAKE_BUILD_TYPE=Release "${JUCE_ARG[@]+"${JUCE_ARG[@]}"}"
-cmake --build build-mac --config Release --target GlitchNasty_AU GlitchNasty_VST3 GlitchNasty_Standalone GlitchNastyTests -j "$(sysctl -n hw.ncpu)"
+cmake --build build-mac --config Release --target GlitchNasty_AU GlitchNasty_VST3 GlitchNasty_Standalone GlitchNastyTests GlitchNastyProcessorTests -j "$(sysctl -n hw.ncpu)"
 
 echo "Running engine tests..."
 ./build-mac/GlitchNastyTests
+./build-mac/GlitchNastyProcessorTests_artefacts/Release/GlitchNastyProcessorTests
 
 # COPY_PLUGIN_AFTER_BUILD already installed them; make sure Logic/GarageBand see the new AU right away
 killall -9 AudioComponentRegistrar 2>/dev/null || true

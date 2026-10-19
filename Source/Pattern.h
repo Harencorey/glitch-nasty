@@ -179,7 +179,99 @@ struct StepData
     float send = 1.0f;     // how much of this glitch goes to the delay/reverb (0..1)
 };
 
-using Pattern = std::array<StepData, kMaxSteps>;
+//==============================================================================
+// Two lanes per pattern. Lane 2 runs in series after lane 1: its glitches
+// process whatever lane 1 puts out, so they stack (a Roll on lane 2 over a
+// Pitch tie on lane 1 rolls the pitched sound).
+constexpr int kNumLanes = 2;
+
+// Parameter locks: per step, a lane can override one of these for whatever
+// glitch is playing on that step - even in the middle of a tie.
+enum class ModTarget : int { ctl1 = 0, ctl2, level, pan, filter, bits, rate, send };
+constexpr int kNumModTargets = 8;
+constexpr const char* kModTargetNames[kNumModTargets] = { "Ctl 1", "Ctl 2", "Level", "Pan", "Filter", "Bits", "Rate", "Send" };
+constexpr float kModUnset = -1.0f;
+
+using Steps = std::array<StepData, kMaxSteps>;
+using ModTable = std::array<std::array<float, kMaxSteps>, kNumModTargets>; // values 0..1, kModUnset = no lock
+
+inline ModTable emptyMods()
+{
+    ModTable m {};
+    for (auto& row : m) row.fill (kModUnset);
+    return m;
+}
+
+inline bool isSet (float modValue) noexcept { return modValue >= 0.0f; }
+
+// A lock value (0..1) applied to a step's settings.
+inline void applyMod (StepData& s, ModTarget t, float v) noexcept
+{
+    v = clamp01 (v);
+    switch (t)
+    {
+        case ModTarget::ctl1:   s.p1 = v; break;
+        case ModTarget::ctl2:   s.p2 = v; break;
+        case ModTarget::level:  s.levelDb = kLevelMinDb + (kLevelMaxDb - kLevelMinDb) * v; break;
+        case ModTarget::pan:    s.pan = v * 2.0f - 1.0f; break;
+        case ModTarget::filter: s.filter = v * 2.0f - 1.0f; break;
+        case ModTarget::bits:   s.bits = v; break;
+        case ModTarget::rate:   s.rate = v; break;
+        case ModTarget::send:   s.send = v; break;
+    }
+}
+
+// The 0..1 value a step has for a target (what a lock would replace).
+inline float modValueOf (const StepData& s, ModTarget t) noexcept
+{
+    switch (t)
+    {
+        case ModTarget::ctl1:   return s.p1;
+        case ModTarget::ctl2:   return s.p2;
+        case ModTarget::level:  return (s.levelDb - kLevelMinDb) / (kLevelMaxDb - kLevelMinDb);
+        case ModTarget::pan:    return (s.pan + 1.0f) * 0.5f;
+        case ModTarget::filter: return (s.filter + 1.0f) * 0.5f;
+        case ModTarget::bits:   return s.bits;
+        case ModTarget::rate:   return s.rate;
+        case ModTarget::send:   return s.send;
+    }
+    return 0.0f;
+}
+
+struct Lane
+{
+    Steps steps {};
+    ModTable mod = emptyMods();
+};
+
+struct Pattern
+{
+    std::array<Lane, kNumLanes> lanes {};
+
+    // Shorthand for lane 1 (most code and the tests think in lane 1).
+    StepData& operator[] (size_t i) noexcept             { return lanes[0].steps[i]; }
+    const StepData& operator[] (size_t i) const noexcept { return lanes[0].steps[i]; }
+    auto begin() noexcept       { return lanes[0].steps.begin(); }
+    auto end() noexcept         { return lanes[0].steps.end(); }
+    auto begin() const noexcept { return lanes[0].steps.begin(); }
+    auto end() const noexcept   { return lanes[0].steps.end(); }
+};
+
+// The step that owns column 'col' in a lane: itself, or the tie that covers it.
+inline int ownerOf (const Steps& steps, int col, int numSteps) noexcept
+{
+    int owner = col;
+    for (int i = 0; i < numSteps; ++i)
+    {
+        const int len = std::max (1, std::min (steps[(size_t) i].length, numSteps - i));
+        if (steps[(size_t) i].on && len > 1)
+        {
+            if (col > i && col < i + len) owner = i;
+            i += len - 1;
+        }
+    }
+    return owner;
+}
 
 struct PatternBank
 {
@@ -206,7 +298,7 @@ inline StepData makeStep (StutterType type, int division, float chance = 1.0f, i
     return s;
 }
 
-// Factory patterns: A shows the basics, B-G show off the types, H is empty.
+// Factory patterns: A shows the basics, B-G show off the types, H step-sequences pitch.
 inline PatternBank makeDefaultBank()
 {
     using T = StutterType;
@@ -249,10 +341,18 @@ inline PatternBank makeDefaultBank()
     E[0] = makeStep (T::pitch, kDiv16, 1.0f, 8);
     E[0].p1 = 0.5f;  // 0 st
     E[0].p2 = 1.0f;  // glide +24
-    E[4] = makeStep (T::roll, kDiv32);      // a layer: rolls the rising pitch
     E[8] = makeStep (T::pitch, kDiv32, 1.0f, 8);
     E[8].p2 = 0.0f;  // glide -24
-    E[12] = makeStep (T::reverse, kDiv64);  // a layer: reverses the falling pitch
+    E.lanes[1].steps[4] = makeStep (T::roll, kDiv32, 1.0f, 2);   // lane 2: rolls the rising pitch
+    E.lanes[1].steps[12] = makeStep (T::reverse, kDiv64);        // lane 2: reverses the falling pitch
+
+    auto& G2 = b.patterns[7]; // H: step-sequenced pitch on one long glitch (parameter locks)
+    G2[0] = makeStep (T::pitch, kDiv16, 1.0f, 16);
+    G2[0].p1 = 0.5f;
+    G2[0].p2 = 0.5f;
+    const float notes[16] = { 0, 0, 12, 0, 7, 0, 12, 5, 0, 0, -12, 0, 7, 12, 3, -5 };
+    for (int i = 0; i < 16; ++i)
+        G2.lanes[0].mod[(size_t) ModTarget::ctl1][(size_t) i] = 0.5f + notes[i] / 48.0f;
 
     auto& F = b.patterns[5]; // textures
     F[0]  = makeStep (T::freeze, kDiv16, 1.0f, 4);
@@ -273,7 +373,7 @@ inline PatternBank makeDefaultBank()
     for (int t = 0; t < kNumStutterTypes; ++t)
         b.live[(size_t) t] = makeStep ((T) t, kDiv16);
 
-    return b; // H stays empty
+    return b;
 }
 
 } // namespace gn

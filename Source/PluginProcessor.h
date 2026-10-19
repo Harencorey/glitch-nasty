@@ -44,24 +44,37 @@ public:
     struct RandomLocks { bool onOff = false, type = false, repeat = false, chance = false, shape = false; };
 
     gn::Pattern getPattern (int pattern) const;
-    gn::StepData getStep (int pattern, int step) const;
+    gn::StepData getStep (int pattern, int lane, int step) const;
     int getEditPattern() const;   // the pattern the Pattern control points at
     int getNumSteps() const;
     double getGridPpq() const;
 
-    void editStep (int pattern, int step, const std::function<void (gn::StepData&)>& change);
+    void editStep (int pattern, int lane, int step, const std::function<void (gn::StepData&)>& change);
     gn::StepData getLiveStep (int type) const;
     void editLiveStep (int type, const std::function<void (gn::StepData&)>& change);
     // Drag a step's edges: it now spans newStart..newEnd. Moving the start moves the
-    // step's settings with it; layers that fall outside the new span are switched off.
-    void setStepSpan (int pattern, int oldStart, int newStart, int newEnd);
+    // step's settings with it. Steps it covers are kept (they come back when it shrinks).
+    void setStepSpan (int pattern, int lane, int oldStart, int newStart, int newEnd);
+
+    // Parameter locks: value 0..1, or gn::kModUnset to clear.
+    float getMod (int pattern, int lane, int target, int step) const;
+    void setMod (int pattern, int lane, int target, int step, float value);
+    void clearMods (int pattern, int lane, int target);
+
+    // Whole-pattern tools (copy/paste take both lanes; the rest act on one lane, locks included).
     void copyPattern (int pattern);
     void pastePattern (int pattern);
     bool hasClipboard() const noexcept { return clipboardValid; }
-    void shiftPattern (int pattern, int direction);
-    void reversePattern (int pattern);
-    void clearPattern (int pattern);
-    void randomizePattern (int pattern, const RandomLocks& locks);
+    void shiftPattern (int pattern, int lane, int direction);
+    void reversePattern (int pattern, int lane);
+    void clearPattern (int pattern, int lane);
+    void randomizePattern (int pattern, int lane, const RandomLocks& locks);
+
+    // Editor state (message thread; saved with the session so the editor reopens as you left it).
+    int getActiveLane() const noexcept { return activeLane; }
+    void setActiveLane (int lane) noexcept { activeLane = juce::jlimit (0, gn::kNumLanes - 1, lane); }
+    int getBarsTarget() const noexcept { return barsTarget; }          // -1 = Chance, else a gn::ModTarget
+    void setBarsTarget (int t) noexcept { barsTarget = juce::jlimit (-1, gn::kNumModTargets - 1, t); }
 
     juce::UndoManager undoManager;
     juce::AudioProcessorValueTreeState apvts;
@@ -72,7 +85,8 @@ public:
     std::atomic<int> livePad { -1 };
 
     // Audio thread -> UI (read on a timer, never blocks either side).
-    std::atomic<int> uiPlayingStep { -1 }, uiFiringStep { -1 }, uiFiringLen { 1 }, uiLiveType { -1 }, uiPattern { 0 }, uiLayerStep { -1 };
+    std::atomic<int> uiPlayingStep { -1 }, uiLiveType { -1 }, uiPattern { 0 };
+    std::array<std::atomic<int>, gn::kNumLanes> uiFiringStep { -1, -1 }, uiFiringLen { 1, 1 };
     std::atomic<bool> uiEngaged { true }, uiEngagePending { false }, uiHostClock { false };
     std::atomic<float> uiBpm { 120.0f };
 
@@ -88,6 +102,7 @@ private:
     juce::CriticalSection bankLock;
     gn::Pattern clipboard {};
     bool clipboardValid = false;
+    int activeLane = 0, barsTarget = -1;
     juce::Random random;
 
     std::array<gn::MidiEvent, 512> midiEvents {};
@@ -123,7 +138,11 @@ private:
     void readParameters();
     void publishBank (bool notifyHost); // call with bankLock held
     juce::ValueTree patternsToTree (const gn::PatternBank&) const;
-    static void patternsFromTree (const juce::ValueTree&, gn::PatternBank&);
+    void patternsFromTree (const juce::ValueTree&, gn::PatternBank&);
+public:
+    // 0.4 kept "layers" as on-steps inside a tie; 0.5 moves them to lane 2. (Public for the tests.)
+    static void migrateLayersToLane2 (gn::Pattern&);
+private:
     static bool migrateOldStepParams (const juce::XmlElement&, gn::PatternBank&);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlitchNastyProcessor)

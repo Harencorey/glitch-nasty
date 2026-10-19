@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 if(NOT DEFINED GN_VERSION)
-    set(GN_VERSION 0.4.0)   # CI passes 0.4.<build number>
+    set(GN_VERSION 0.5.0)   # CI passes 0.5.<build number>
 endif()
 project(GlitchNasty VERSION ${GN_VERSION} LANGUAGES C CXX)
 
@@ -80,4 +80,23 @@ if(GN_BUILD_TESTS)
     add_executable(GlitchNastyTests tests/test_engine.cpp)
     target_include_directories(GlitchNastyTests PRIVATE Source)
     add_test(NAME engine COMMAND GlitchNastyTests)
+
+    # Plug-in level tests: the real processor, edited like the UI does and saved/loaded like a host does.
+    juce_add_console_app(GlitchNastyProcessorTests PRODUCT_NAME "GlitchNastyProcessorTests")
+    target_sources(GlitchNastyProcessorTests PRIVATE
+        tests/test_processor.cpp
+        Source/PluginProcessor.cpp
+        Source/PluginEditor.cpp
+        Source/StepGrid.cpp
+        Source/StepEditor.cpp
+        Source/PatternBar.cpp
+        Source/LivePanel.cpp
+        Source/FxPanel.cpp)
+    target_include_directories(GlitchNastyProcessorTests PRIVATE Source)
+    target_compile_definitions(GlitchNastyProcessorTests PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+        JucePlugin_Name="Glitch Nasty" JucePlugin_VersionString="${GN_VERSION}")
+    target_link_libraries(GlitchNastyProcessorTests PRIVATE
+        juce::juce_audio_utils juce::juce_dsp juce::juce_recommended_config_flags)
+    add_test(NAME processor COMMAND GlitchNastyProcessorTests)
 endif()

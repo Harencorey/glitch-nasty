@@ -3,8 +3,10 @@
 // Glitch Nasty - GlitchCore
 //
 // The whole audio path in one JUCE-free class:
-//   clock -> grid (with swing) -> pattern (chance, density, seed, ties)
-//         -> stutter engine
+//   clock -> grid (with swing) -> pattern (chance, density, seed, ties,
+//            per-step parameter locks) -> lane 1 engine -> lane 2 engine
+// Lane 2 is a second, independent sequence whose glitches process lane 1's
+// output (so a Roll on lane 2 rolls whatever lane 1 is doing).
 // plus live performance: MIDI notes / UI pads trigger glitches (optionally
 // quantised), MIDI notes switch patterns, and a footswitch (sustain pedal)
 // engages/disengages the pattern on the next bar line.
@@ -96,31 +98,30 @@ public:
     {
         sr = sampleRate;
         channels = std::clamp (numChannels, 1, 2);
-        engine.prepare (numChannels, sampleRate, kBufferSeconds);
-        layer.prepare (numChannels, sampleRate, kBufferSeconds);
+        for (auto& l : lanes)
+            l.engine.prepare (numChannels, sampleRate, kBufferSeconds);
         delay.prepare (sampleRate, 6.5);
         reverb.prepare (sampleRate);
         globalCrusher.prepare (sampleRate);
-        for (auto* v : { &sendBuf, &layerSendBuf, &delayOut, &reverbOut })
+        for (auto* v : { &sendBuf, &lane2SendBuf, &delayOut, &reverbOut })
             for (auto& ch : *v)
                 ch.assign ((size_t) kMaxChunk, 0.0f);
-        layerActBuf.assign ((size_t) kMaxChunk, 0.0f);
+        lane2ActBuf.assign ((size_t) kMaxChunk, 0.0f);
         reset();
     }
 
     void reset()
     {
-        engine.reset();
-        layer.reset();
-        layerStep = -1;
-        tiePattern = 0;
+        for (auto& l : lanes)
+        {
+            l.engine.reset();
+            l.clear();
+        }
         stepSched.reset();
         barSched.reset();
         quantSched.reset();
         internalPpq = 0.0;
-        playingStep = firingStep = -1;
-        firingLen = 1;
-        tieRemaining = 0;
+        playingStep = -1;
         heldCount = 0;
         liveType = pendingLive = -1;
         lastPad = -1;
@@ -131,7 +132,6 @@ public:
         engaged = engageTarget = true;
         engageInit = false;
         liveCounter = 0;
-        firingType = -1;
         delay.reset();
         reverb.reset();
         globalCrusher.reset();
@@ -173,8 +173,8 @@ private:
     {
         params = &p;
         bankPtr = &bank;
-        engine.setMix (p.mix);
-        layer.setMix (1.0f); // the layer works on the glitch's output; Mix is applied once, by the first engine
+        for (auto& l : lanes)
+            l.engine.setMix (p.mix);
 
         // ---- Clock ---------------------------------------------------------
         hostClock = (p.syncMode == 0 && host.hasPpq && host.hasBpm);
@@ -234,14 +234,12 @@ private:
             for (int m = 0; m < numMidi; ++m)
                 handleMidi (midi[m], false);
             engaged = engageTarget;
-            engine.stopStutter (fade);
-            stopLayer();
+            stopAllLanes();
             liveType = pendingLive = -1;
-            tieRemaining = 0;
             stepSched.reset();
             barSched.reset();
             quantSched.reset();
-            playingStep = firingStep = -1;
+            playingStep = -1;
             liveChanged = true; // re-check held notes when playback starts
             runEngines (io, numCh, 0, numSamples);
             applyFx (io, numCh, numSamples); // tails keep ringing while stopped
@@ -263,10 +261,7 @@ private:
 
         if (resynced)
         {
-            engine.stopStutter (fade);
-            stopLayer();
-            firingStep = -1;
-            tieRemaining = 0;
+            stopAllLanes();
             liveType = pendingLive = -1;
             engaged = engageTarget; // starting / locating applies Engage right away
             playingStep = stepIndex (stepSched.currentStep(), p.numSteps);
@@ -281,19 +276,10 @@ private:
 
         // Knob moves on whatever is glitching right now take effect immediately.
         if (liveType >= 0)
-            engine.updateControls (controlsOf (bank.live[(size_t) liveType]));
-        else if (firingStep >= 0)
-        {
-            const auto& s = bank.patterns[(size_t) firingPattern][(size_t) firingStep]; // the step that's actually playing
-            if (s.type == firingType)
-                engine.updateControls (controlsOf (s));
-        }
-        if (layerStep >= 0)
-        {
-            const auto& s = bank.patterns[(size_t) tiePattern][(size_t) layerStep];
-            if (s.type == layerType)
-                layer.updateControls (controlsOf (s));
-        }
+            lanes[0].engine.updateControls (controlsOf (bank.live[(size_t) liveType]));
+        else
+            for (int L = 0; L < kNumLanes; ++L)
+                refreshLaneControls (L);
 
         // ---- Walk the block in time order ----------------------------------
         // At the same sample: MIDI first, then bar lines, then steps, then
@@ -331,11 +317,10 @@ private:
 
 public:
     // For the UI.
-    int getPlayingStep() const noexcept       { return playingStep; }
-    int getFiringStep() const noexcept        { return firingStep; }
-    int getFiringLength() const noexcept      { return firingLen; }
-    int getLiveType() const noexcept          { return liveType; }
-    int getLayerStep() const noexcept         { return layerStep; }
+    int getPlayingStep() const noexcept             { return playingStep; }
+    int getFiringStep (int lane = 0) const noexcept   { return lanes[(size_t) std::clamp (lane, 0, kNumLanes - 1)].firingStep; }
+    int getFiringLength (int lane = 0) const noexcept { return lanes[(size_t) std::clamp (lane, 0, kNumLanes - 1)].firingLen; }
+    int getLiveType() const noexcept                { return liveType; }
     int getEffectivePattern() const noexcept  { return currentPatternIndex(); }
     bool isEngaged() const noexcept           { return engaged; }
     bool isEngagePending() const noexcept     { return engaged != engageTarget; }
@@ -378,126 +363,131 @@ private:
         const int numSteps = std::clamp (params->numSteps, 1, kMaxSteps);
         const int idx = stepIndex (ev.step, numSteps);
         playingStep = idx;
+        for (int L = 0; L < kNumLanes; ++L)
+            onLaneStep (L, ev, idx, numSteps);
+    }
 
-        if (tieRemaining > 0) // still inside a tied glitch
+    // One lane's step: either a step inside a running tie (its parameter locks
+    // land now, at the exact sample), or a new step that may fire.
+    void onLaneStep (int L, const GridEvent& ev, int idx, int numSteps) noexcept
+    {
+        auto& ln = lanes[(size_t) L];
+
+        if (ln.tieRemaining > 0) // still inside a tied glitch
         {
-            --tieRemaining;
-            onLayerStep (ev, idx);
+            --ln.tieRemaining;
+            ln.curStep = idx;
+            if (liveType < 0)
+                refreshLaneControls (L);
             return;
         }
 
-        stopLayer(); // layers only live inside the tie that holds them
-
-        if (liveType >= 0) // live notes/pads override the pattern
+        if (liveType >= 0) // live notes/pads override the pattern (lane 1 plays the pad, lane 2 rests)
+        {
+            if (L > 0) stopLane (L);
             return;
+        }
 
         if (! engaged)
         {
-            stopPattern();
+            stopLane (L);
             return;
         }
 
-        const StepData& s = bankPtr->patterns[(size_t) currentPatternIndex()][(size_t) idx];
+        const int pat = currentPatternIndex();
+        const auto& lane = bankPtr->patterns[(size_t) pat].lanes[(size_t) L];
+        const StepData& s = lane.steps[(size_t) idx];
         if (! s.on)
         {
-            stopPattern();
+            stopLane (L);
             return;
         }
 
         const int len = std::clamp (s.length, 1, numSteps - idx);
-        tieRemaining = len - 1; // the following steps belong to this one, fire or not
-        tiePattern = currentPatternIndex();
+        ln.tieRemaining = len - 1; // the following steps belong to this one, fire or not
 
         const float chance = applyDensity (s.chance, params->density);
-        const float dice = rand01 (seedBase, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
+        const uint32_t laneSalt = L == 0 ? 0u : 0x51ED27u;
+        const float dice = rand01 (seedBase ^ laneSalt, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
         if (! (chance >= 0.999f || dice < chance))
         {
-            stopPattern();
+            stopLane (L);
             return;
         }
 
+        const StepData e = effectiveStep (lane, idx, idx);
         StutterSettings st;
-        st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
-        st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * spq;
+        st.type = (StutterType) std::clamp (e.type, 0, kNumStutterTypes - 1);
+        st.sliceLen = kDivisionPpq[std::clamp (e.division, 0, kNumDivisions - 1)] * spq;
         st.stepLen = (GridScheduler::stepStart (ev.step + len, swing) - GridScheduler::stepStart (ev.step, swing)) * samplesPerStep;
         st.lateBy = ev.lateBy;
         st.minPeriod = spq / 32.0; // Roll bottoms out at 1/128 notes
         st.fadeSamples = fade;
-        st.p1 = s.p1;
-        st.p2 = s.p2;
-        st.level = levelGain (s.levelDb);
-        st.pan = s.pan;
-        st.filter = s.filter;
-        st.bits = s.bits;
-        st.rate = s.rate;
-        st.send = s.send;
-        st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + 0x68e31da4u));
-        engine.startStutter (st);
+        st.p1 = e.p1;
+        st.p2 = e.p2;
+        st.level = levelGain (e.levelDb);
+        st.pan = e.pan;
+        st.filter = e.filter;
+        st.bits = e.bits;
+        st.rate = e.rate;
+        st.send = e.send;
+        st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + (L == 0 ? 0x68e31da4u : 0x2545F491u)));
+        ln.engine.startStutter (st);
 
-        firingStep = idx;
-        firingLen = len;
-        firingType = s.type;
-        firingPattern = currentPatternIndex();
+        ln.firingStep = idx;
+        ln.curStep = idx;
+        ln.firingLen = len;
+        ln.firingType = s.type;
+        ln.firingPattern = pat;
     }
 
-    void stopPattern() noexcept
+    // The owner step's settings with the locks drawn on step 'at' applied on top.
+    static StepData effectiveStep (const Lane& lane, int owner, int at) noexcept
     {
-        engine.stopStutter (fade);
-        stopLayer();
-        firingStep = -1;
-    }
-
-    void stopLayer() noexcept
-    {
-        layer.stopStutter (fade);
-        layerStep = -1;
-    }
-
-    // A step inside a tie that's switched on: its glitch stacks on top of the
-    // tied one (a second engine working on the first one's output), for one step.
-    void onLayerStep (const GridEvent& ev, int idx) noexcept
-    {
-        if (liveType >= 0 || ! engaged)
+        StepData e = lane.steps[(size_t) owner];
+        for (int t = 0; t < kNumModTargets; ++t)
         {
-            stopLayer();
-            return;
+            const float v = lane.mod[(size_t) t][(size_t) at];
+            if (isSet (v))
+                applyMod (e, (ModTarget) t, v);
         }
+        return e;
+    }
 
-        const StepData& s = bankPtr->patterns[(size_t) tiePattern][(size_t) idx];
-        const float chance = applyDensity (s.chance, params->density);
-        const float dice = rand01 (seedBase ^ 0x51ED27u, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
-        if (! s.on || ! (chance >= 0.999f || dice < chance))
+    // Push the playing step's current settings (knob edits + locks) into the lane's engine.
+    void refreshLaneControls (int L) noexcept
+    {
+        auto& ln = lanes[(size_t) L];
+        if (ln.firingStep < 0 || ln.curStep < 0)
+            return;
+        const auto& lane = bankPtr->patterns[(size_t) ln.firingPattern].lanes[(size_t) L];
+        if (lane.steps[(size_t) ln.firingStep].type != ln.firingType)
+            return; // the type was changed while it plays: the new one takes over next time
+        ln.engine.updateControls (controlsOf (effectiveStep (lane, ln.firingStep, ln.curStep)));
+    }
+
+    void stopLane (int L) noexcept
+    {
+        auto& ln = lanes[(size_t) L];
+        ln.engine.stopStutter (fade);
+        ln.firingStep = -1;
+        ln.curStep = -1;
+    }
+
+    void stopAllLanes() noexcept
+    {
+        for (int L = 0; L < kNumLanes; ++L)
         {
-            stopLayer();
-            return;
+            stopLane (L);
+            lanes[(size_t) L].tieRemaining = 0;
         }
-
-        StutterSettings st;
-        st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
-        st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * spq;
-        st.stepLen = (GridScheduler::stepStart (ev.step + 1, swing) - GridScheduler::stepStart (ev.step, swing)) * samplesPerStep;
-        st.lateBy = ev.lateBy;
-        st.minPeriod = spq / 32.0;
-        st.fadeSamples = fade;
-        st.p1 = s.p1;
-        st.p2 = s.p2;
-        st.level = levelGain (s.levelDb);
-        st.pan = s.pan;
-        st.filter = s.filter;
-        st.bits = s.bits;
-        st.rate = s.rate;
-        st.send = s.send;
-        st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + 0x2545F491u));
-        layer.startStutter (st);
-        layerStep = idx;
-        layerType = s.type;
     }
 
     void runEngines (float* const* io, int numCh, int start, int num) noexcept
     {
-        engine.process (io, numCh, start, num, sendPtrs());
-        float* ls[2] = { layerSendBuf[0].data(), layerSendBuf[1].data() };
-        layer.process (io, numCh, start, num, ls, layerActBuf.data());
+        lanes[0].engine.process (io, numCh, start, num, sendPtrs());
+        float* ls[2] = { lane2SendBuf[0].data(), lane2SendBuf[1].data() };
+        lanes[1].engine.process (io, numCh, start, num, ls, lane2ActBuf.data());
     }
 
     void onBar() noexcept
@@ -507,10 +497,7 @@ private:
 
         engaged = engageTarget;
         if (! engaged && liveType < 0)
-        {
-            stopPattern();
-            tieRemaining = 0;
-        }
+            stopAllLanes();
     }
 
     void onQuant (const GridEvent& ev) noexcept
@@ -601,8 +588,7 @@ private:
             if (liveType >= 0)
             {
                 liveType = -1;
-                tieRemaining = 0;
-                stopPattern();
+                stopAllLanes();
             }
             return;
         }
@@ -638,11 +624,11 @@ private:
         st.rate = pad.rate;
         st.send = pad.send;
         st.seed = hash32 (seedBase ^ (0xA5A5A5A5u + ++liveCounter));
-        engine.startStutter (st);
-        stopLayer();
+        lanes[0].engine.startStutter (st);
+        lanes[0].firingStep = lanes[0].curStep = -1;
+        stopLane (1);
 
         liveType = type;
-        firingStep = -1;
     }
 
     static LiveControls controlsOf (const StepData& s) noexcept
@@ -699,12 +685,12 @@ private:
         if (! runDelay && ! runReverb)
             return;
 
-        // While a layer plays, the effects hear the layered sound instead of the tied glitch under it.
+        // While lane 2 glitches, the effects hear its output (which already contains lane 1's glitch).
         if (p.fxSource == 0)
             for (int c = 0; c < numCh; ++c)
                 for (int i = 0; i < numSamples; ++i)
-                    sendBuf[(size_t) c][(size_t) i] = sendBuf[(size_t) c][(size_t) i] * (1.0f - layerActBuf[(size_t) i])
-                                                      + layerSendBuf[(size_t) c][(size_t) i];
+                    sendBuf[(size_t) c][(size_t) i] = sendBuf[(size_t) c][(size_t) i] * (1.0f - lane2ActBuf[(size_t) i])
+                                                      + lane2SendBuf[(size_t) c][(size_t) i];
 
         const float* src[2] = { p.fxSource == 1 ? io[0] : sendBuf[0].data(),
                                 p.fxSource == 1 ? (numCh > 1 ? io[1] : io[0]) : sendBuf[1].data() };
@@ -733,19 +719,28 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    StutterEngine engine, layer;
+    struct LaneState
+    {
+        StutterEngine engine;
+        int tieRemaining = 0;   // steps left in the tie that's running
+        int firingStep = -1;    // the step whose glitch is playing (-1 = none)
+        int curStep = -1;       // the step the playhead is on inside it (whose locks apply)
+        int firingLen = 1, firingType = -1, firingPattern = 0;
+
+        void clear() noexcept { tieRemaining = 0; firingStep = curStep = -1; firingLen = 1; firingType = -1; firingPattern = 0; }
+    };
+
+    std::array<LaneState, kNumLanes> lanes;
     TempoDelay delay;
     Reverb reverb;
     Crusher globalCrusher;
-    std::array<std::vector<float>, 2> sendBuf, layerSendBuf, delayOut, reverbOut;
-    std::vector<float> layerActBuf;
-    int layerStep = -1, layerType = -1, tiePattern = 0;
+    std::array<std::vector<float>, 2> sendBuf, lane2SendBuf, delayOut, reverbOut;
+    std::vector<float> lane2ActBuf;
     float* sendPtrArray[2] {};
     std::array<MidiEvent, 512> chunkMidi {};
     int channels = 2;
     bool delayActive = false, reverbActive = false;
     float delayMixNow = 0.0f, reverbMixNow = 0.0f, crushMixNow = 0.0f;
-    int firingType = -1, firingPattern = 0;
     GridScheduler stepSched, barSched, quantSched;
     std::array<GridEvent, GridScheduler::kMaxEvents> stepEvents {}, barEvents {}, quantEvents {};
     std::array<Held, kMaxHeld> held {};
@@ -759,7 +754,7 @@ private:
     uint32_t seedBase = 0, liveCounter = 0;
     bool hostClock = false;
 
-    int playingStep = -1, firingStep = -1, firingLen = 1, tieRemaining = 0;
+    int playingStep = -1;
     int heldCount = 0, liveType = -1, pendingLive = -1, lastPad = -1;
     bool liveChanged = false;
     int patternOverride = -1, lastParamPattern = -1;

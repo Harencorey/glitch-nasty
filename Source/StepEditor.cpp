@@ -1,20 +1,5 @@
 #include "StepEditor.h"
-
-namespace
-{
-juce::String signedValue (double v, int decimals, const juce::String& unit)
-{
-    const auto s = juce::String (std::abs (v), decimals);
-    return (v > 0.0005 ? "+" : (v < -0.0005 ? "-" : "")) + s + unit;
-}
-
-juce::String percent (double v) { return juce::String (juce::roundToInt (v * 100.0)) + " %"; }
-
-juce::String hz (double f)
-{
-    return f >= 1000.0 ? juce::String (f / 1000.0, f >= 10000.0 ? 0 : 1) + "k" : juce::String (juce::roundToInt (f));
-}
-} // namespace
+#include "Format.h"
 
 StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
 {
@@ -36,43 +21,34 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
     lvl.setRange (gn::kLevelMinDb, gn::kLevelMaxDb, 0.1);
     lvl.setSkewFactorFromMidPoint (-6.0);
     lvl.setDoubleClickReturnValue (true, 0.0);
-    lvl.textFromValueFunction = [] (double v) { return v <= gn::kLevelMinDb + 0.05 ? juce::String ("Off") : signedValue (v, 1, " dB"); };
+    lvl.textFromValueFunction = [] (double v) { return gn::fmt::level (v); };
 
     auto& pan = knobs[kPan].slider;
     pan.setRange (-1.0, 1.0, 0.01);
     pan.setDoubleClickReturnValue (true, 0.0);
     pan.getProperties().set ("bipolar", true);
-    pan.textFromValueFunction = [] (double v)
-    {
-        const int pc = juce::roundToInt (std::abs (v) * 100.0);
-        return pc == 0 ? juce::String ("C") : (v < 0 ? "L " : "R ") + juce::String (pc);
-    };
+    pan.textFromValueFunction = [] (double v) { return gn::fmt::pan (v); };
 
     auto& flt = knobs[kFilter].slider;
     flt.setRange (-1.0, 1.0, 0.01);
     flt.setDoubleClickReturnValue (true, 0.0);
     flt.getProperties().set ("bipolar", true);
-    flt.textFromValueFunction = [] (double v)
-    {
-        if (v < -0.001) return "LP " + hz (gn::filterLpHz ((float) v));
-        if (v > 0.001)  return "HP " + hz (gn::filterHpHz ((float) v));
-        return juce::String ("Off");
-    };
+    flt.textFromValueFunction = [] (double v) { return gn::fmt::filter (v); };
 
     auto& bits = knobs[kBits].slider;
     bits.setRange (0.0, 1.0, 0.001);
     bits.setDoubleClickReturnValue (true, 0.0);
-    bits.textFromValueFunction = [] (double v) { return v < 0.001 ? juce::String ("Off") : juce::String (gn::crushBits ((float) v), 1) + " bit"; };
+    bits.textFromValueFunction = [] (double v) { return gn::fmt::bits (v); };
 
     auto& rate = knobs[kRate].slider;
     rate.setRange (0.0, 1.0, 0.001);
     rate.setDoubleClickReturnValue (true, 0.0);
-    rate.textFromValueFunction = [] (double v) { return v < 0.001 ? juce::String ("Off") : "/" + juce::String (gn::crushRateFactor ((float) v), 1); };
+    rate.textFromValueFunction = [] (double v) { return gn::fmt::rate (v); };
 
     auto& send = knobs[kSend].slider;
     send.setRange (0.0, 1.0, 0.01);
     send.setDoubleClickReturnValue (true, 1.0);
-    send.textFromValueFunction = [] (double v) { return percent (v); };
+    send.textFromValueFunction = [] (double v) { return gn::fmt::percent (v); };
 
     for (int k : { kBits, kRate, kSend })
         knobs[(size_t) k].slider.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff53d7ff));
@@ -97,11 +73,18 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
     startTimerHz (15);
 }
 
-void StepEditor::setStep (int newStep)
+void StepEditor::setStep (int newLane, int column)
 {
-    step = juce::jlimit (0, gn::kMaxSteps - 1, newStep);
+    lane = juce::jlimit (0, gn::kNumLanes - 1, newLane);
+    step = juce::jlimit (0, gn::kMaxSteps - 1, column);
     liveTarget = false;
     refresh (true);
+}
+
+int StepEditor::ownerStep() const
+{
+    const auto pat = processor.getPattern (processor.getEditPattern());
+    return gn::ownerOf (pat.lanes[(size_t) lane].steps, step, processor.getNumSteps());
 }
 
 void StepEditor::setLivePad (int type)
@@ -113,13 +96,13 @@ void StepEditor::setLivePad (int type)
 
 gn::StepData StepEditor::readTarget() const
 {
-    return liveTarget ? processor.getLiveStep (liveType) : processor.getStep (processor.getEditPattern(), step);
+    return liveTarget ? processor.getLiveStep (liveType) : processor.getStep (processor.getEditPattern(), lane, ownerStep());
 }
 
 void StepEditor::editTarget (const std::function<void (gn::StepData&)>& change)
 {
     if (liveTarget) processor.editLiveStep (liveType, change);
-    else            processor.editStep (processor.getEditPattern(), step, change);
+    else            processor.editStep (processor.getEditPattern(), lane, ownerStep(), change);
     current = readTarget();
 }
 
@@ -168,36 +151,15 @@ void StepEditor::configureTypeKnob (int which, int type)
 
 juce::String StepEditor::formatTypeControl (int which, double v) const
 {
-    using T = gn::StutterType;
     const auto& tc = typeControl (which);
-    if (tc.numChoices > 0)
-        return tc.choices[juce::jlimit (0, tc.numChoices - 1, juce::roundToInt (v))];
-
-    const float p = (float) v;
-    const bool first = which == kCtl1;
-    auto offsetText = [this, p]
+    const float p = tc.numChoices > 1 ? (float) v / (float) (tc.numChoices - 1) : (float) v;
+    int slices = 0;
+    if (! liveTarget)
     {
-        if (liveTarget) return "Slice " + percent (p);
         const double stepPpq = processor.getGridPpq() * (double) current.length;
-        const int n = gn::slicesIn (stepPpq, gn::kDivisionPpq[(size_t) juce::jlimit (0, gn::kNumDivisions - 1, current.division)]);
-        return "Slice " + juce::String (gn::sliceOffset (p, n) + 1) + "/" + juce::String (n);
-    };
-
-    switch ((T) current.type)
-    {
-        case T::repeat:   return first ? offsetText() : percent (p);
-        case T::reverse:  return offsetText();
-        case T::gate:     return percent (gn::gateDuty (p));
-        case T::roll:     return "x" + juce::String (gn::rollFactor (p), 2);
-        case T::pitch:    return signedValue (gn::pitchSemis (p), 1, " st");
-        case T::tapeStop: return p < 0.01f ? juce::String ("Linear") : "Exp " + percent (p);
-        case T::fade:     return juce::String (20.0 * std::log10 (gn::fadeFactor (p)), 1) + " dB/rep";
-        case T::freeze:   return first ? juce::String (juce::roundToInt (gn::freezeGrainMs (p))) + " ms" : percent (p);
-        case T::pingPong: return first ? percent (p) : juce::String (20.0 * std::log10 (gn::pingDecay (p)), 1) + " dB/rep";
-        case T::shuffle:
-        case T::scratch:  return percent (p);
+        slices = gn::slicesIn (stepPpq, gn::kDivisionPpq[(size_t) juce::jlimit (0, gn::kNumDivisions - 1, current.division)]);
     }
-    return percent (p);
+    return gn::fmt::typeControl (current.type, which == kCtl1, p, slices);
 }
 
 void StepEditor::knobChanged (int which)
@@ -246,7 +208,7 @@ void StepEditor::refresh (bool force)
     using gn::exactly;
     const int pat = processor.getEditPattern();
     const auto s = readTarget();
-    const bool changed = force || pat != shownPattern || step != shownStep || liveTarget != shownLive || s.type != shownType
+    const bool changed = force || pat != shownPattern || step != shownStep || lane != shownLane || liveTarget != shownLive || s.type != shownType
                          || ! exactly (s.p1, current.p1) || ! exactly (s.p2, current.p2) || s.length != current.length
                          || ! exactly (s.levelDb, current.levelDb) || ! exactly (s.pan, current.pan)
                          || ! exactly (s.filter, current.filter) || s.division != current.division || s.on != current.on
@@ -265,6 +227,7 @@ void StepEditor::refresh (bool force)
     }
     shownPattern = pat;
     shownStep = step;
+    shownLane = lane;
     shownLive = liveTarget;
 
     auto setTypeKnob = [this] (int which, float p)
@@ -318,21 +281,15 @@ void StepEditor::paint (juce::Graphics& g)
     }
     else
     {
-        // Is this step inside another step's tie? Then it's a layer on top of that glitch.
-        int owner = -1;
         const auto pat = processor.getPattern (processor.getEditPattern());
-        for (int i = 0, n = processor.getNumSteps(); i < n; ++i)
-        {
-            const int len = std::min (pat[(size_t) i].length, n - i);
-            if (pat[(size_t) i].on && len > 1)
-            {
-                if (step > i && step < i + len) owner = i;
-                i += len - 1;
-            }
-        }
-        g.setColour (current.on ? (owner >= 0 ? nasty : acid) : dimText);
-        juce::String title = "STEP " + juce::String (step + 1) + "  " + typeName;
-        if (owner >= 0) title << "  (LAYER ON STEP " << (owner + 1) << ")";
+        const int n = processor.getNumSteps();
+        const int owner = gn::ownerOf (pat.lanes[(size_t) lane].steps, step, n);
+        const int span = current.on ? std::max (1, std::min (current.length, n - owner)) : 1;
+        const auto laneColour = lane == 0 ? acid : gn::colours::lane2;
+        g.setColour (current.on ? laneColour : dimText);
+        juce::String title = "LANE " + juce::String (lane + 1) + "  ";
+        title << (span > 1 ? "STEPS " + juce::String (owner + 1) + "-" + juce::String (owner + span) : "STEP " + juce::String (owner + 1));
+        title << "  " << typeName;
         g.drawText (title, header, juce::Justification::centredLeft);
 
         // How many repeats this step has room for: several controls only show with 2+.
@@ -341,8 +298,15 @@ void StepEditor::paint (juce::Graphics& g)
         g.setColour (dimText);
         g.setFont (juce::FontOptions (12.0f));
         juce::String info = juce::String ("PATTERN ") + gn::kPatternNames[(size_t) processor.getEditPattern()]
-                            + "   " + juce::String (slices - 1) + (slices == 2 ? " repeat" : " repeats") + " in this step";
+                            + "   " + juce::String (slices - 1) + (slices == 2 ? " repeat" : " repeats");
         if (! current.on) info << "   (step is off)";
+
+        // Locks drawn on the selected column (they override the knobs on that step).
+        int locks = 0;
+        for (const auto& row : pat.lanes[(size_t) lane].mod)
+            locks += gn::isSet (row[(size_t) step]) ? 1 : 0;
+        if (locks > 0)
+            info << "   " << locks << (locks == 1 ? " lock" : " locks") << " on step " << (step + 1);
         g.drawText (info, header, juce::Justification::centredRight);
     }
 

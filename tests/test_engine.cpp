@@ -770,10 +770,14 @@ static void testSafety()
                                 pat[(size_t) i] = gn::makeStep ((T) t, div, 1.0f, len);
                                 pat[(size_t) i].p1 = pp.first;
                                 pat[(size_t) i].p2 = pp.second;
-                                // the next step is on too: inside a tie it becomes a layer on top
-                                pat[(size_t) i + 1] = gn::makeStep ((T) ((t + 3) % gn::kNumStutterTypes), gn::kDiv32);
-                                pat[(size_t) i + 1].p1 = pp.second;
-                                pat[(size_t) i + 1].p2 = pp.first;
+                                // lane 2 glitches the lane-1 output, offset by a step, sometimes stretched
+                                auto& l2 = pat.lanes[1].steps[(size_t) i + 1];
+                                l2 = gn::makeStep ((T) ((t + 3) % gn::kNumStutterTypes), gn::kDiv32, 1.0f, len == 3 ? 2 : 1);
+                                l2.p1 = pp.second;
+                                l2.p2 = pp.first;
+                                // and a lock on every other step pushes the controls around mid-tie
+                                pat.lanes[0].mod[(size_t) gn::ModTarget::ctl1][(size_t) i + 1] = 1.0f - pp.first;
+                                pat.lanes[0].mod[(size_t) gn::ModTarget::level][(size_t) i + 1] = 0.8f;
                             }
                         });
                         const auto out = run (counter, p, bank);
@@ -783,7 +787,7 @@ static void testSafety()
                     }
         CHECK (bad == 0, "%d of %d runs read audio from the future", bad, runs);
         CHECK (gAllocCount == 0, "%d heap allocations on the audio path", gAllocCount.load());
-        std::printf ("  %d runs (every type x settings x ties x layers x swing): never plays the future, no allocations\n", runs);
+        std::printf ("  %d runs (every type x settings x ties x lane 2 x locks x swing): never plays the future, no allocations\n", runs);
     }
 
     // No clicks with the default 3 ms crossfade (440 Hz sine, 1/32T: never lines up with the sine).
@@ -825,6 +829,9 @@ static void testSafety()
                 s.levelDb = (float) (i % 3) * -3.0f;
                 s.pan = (i % 2 == 0) ? 0.3f : -0.3f;
                 s.filter = (i % 3 == 0) ? -0.5f : ((i % 3 == 1) ? 0.4f : 0.0f);
+                if (i % 3 == 1) pat.lanes[1].steps[(size_t) i] = gn::makeStep ((T) ((i * 5) % gn::kNumStutterTypes), gn::kDiv32, 1.0f, i % 2 + 1);
+                pat.lanes[0].mod[(size_t) (i % gn::kNumModTargets)][(size_t) i] = (float) ((i * 37) % 100) * 0.01f;
+                pat.lanes[1].mod[(size_t) ((i + 3) % gn::kNumModTargets)][(size_t) i] = (float) ((i * 53) % 100) * 0.01f;
             }
         });
         std::vector<float> in (44100 * 6);
@@ -1068,32 +1075,96 @@ static void testFx()
 }
 
 //------------------------------------------------------------------------------
-// 11) Layers: a step inside a tie that's on stacks its glitch on top of the tied one.
-static void testLayers()
+// 11) Lanes: lane 2 glitches lane 1's output, with its own steps and ties.
+//     Parameter locks change a stretched glitch's controls at exact step lines.
+static void testLanes()
 {
-    std::printf ("Layers (stacked glitches inside a tie)\n");
+    std::printf ("Lanes and parameter locks\n");
     gn::CoreParams p;
     p.crossfadeMs = 0.0f;
-
-    // Step 1 = Pitch -12, tied over 4 steps (repeats of 1/16). Step 3 (inside the tie) = Repeat 1/32:
-    // it records what the Pitch glitch is playing and loops it - a roll of the pitched sound.
-    const auto bank = bankWith ([] (gn::Pattern& pat)
-    {
-        pat[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
-        pat[0].p1 = 0.25f; // -12 st
-        pat[2] = gn::makeStep (T::repeat, gn::kDiv32);
-    });
-    const auto out = run (counterSignal (30000), p, bank);
     auto pitched = [] (size_t n) { return n < 6000 ? (double) n : 0.5 * (double) ((n - 6000) % 6000); };
-    bool ok = true;
-    for (size_t n = 0; n < 24000; ++n)
+
+    // Lane 1: Pitch -12 tied over 4 steps (repeats of 1/16). Lane 2, step 3 = Repeat 1/32:
+    // it records what the Pitch glitch is playing and loops it - a roll of the pitched sound.
     {
-        double expect = pitched (n);
-        if (n >= 15000 && n < 18000) expect = pitched (n - 3000); // the layer's repeat of the pitched audio
-        ok &= std::abs ((double) out[n] - expect) < 0.01;
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
+            pat.lanes[0].steps[0].p1 = 0.25f; // -12 st
+            pat.lanes[1].steps[2] = gn::makeStep (T::repeat, gn::kDiv32);
+        });
+        const auto out = run (counterSignal (30000), p, bank);
+        bool ok = true;
+        for (size_t n = 0; n < 24000; ++n)
+        {
+            double expect = pitched (n);
+            if (n >= 15000 && n < 18000) expect = pitched (n - 3000); // lane 2's repeat of the pitched audio
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "lane 2 didn't process lane 1's glitch");
+        std::printf ("  Lane 2 Repeat over a lane 1 Pitch tie loops the pitched sound, then the pitch carries on\n");
     }
-    CHECK (ok, "layer didn't stack on the tied glitch");
-    std::printf ("  Repeat inside a Pitch tie loops the pitched sound, then the tie carries on underneath\n");
+
+    // Lane 2 stretched over 2 steps: loops the pitched sound for both.
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
+            pat.lanes[0].steps[0].p1 = 0.25f;
+            pat.lanes[1].steps[2] = gn::makeStep (T::repeat, gn::kDiv32, 1.0f, 2);
+        });
+        const auto out = run (counterSignal (30000), p, bank);
+        bool ok = true;
+        for (size_t n = 12000; n < 24000; ++n)
+            ok &= std::abs ((double) out[n] - pitched (12000 + (n - 12000) % 3000)) < 0.01;
+        CHECK (ok, "stretched lane 2 step");
+        std::printf ("  Lane 2 steps stretch too (a 2-step Repeat keeps looping for both steps)\n");
+    }
+
+    // Lane 2 on its own (lane 1 silent) glitches the dry input.
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat) { pat.lanes[1].steps[1] = gn::makeStep (T::repeat, gn::kDiv32); });
+        const auto out = run (counterSignal (24000), p, bank);
+        bool ok = true;
+        for (size_t n = 0; n < 24000; ++n)
+            ok &= std::abs ((double) out[n] - ((n >= 9000 && n < 12000) ? (double) n - 3000.0 : (double) n)) < 0.01;
+        CHECK (ok, "lane 2 alone");
+    }
+
+    // Locks: Pitch tie over 4 steps at 0 st, step 3 locked to -12 st, step 4 unlocked (back to the step's own 0 st).
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat.lanes[0].steps[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
+            pat.lanes[0].steps[0].p1 = 0.5f;
+            pat.lanes[0].steps[0].p2 = 0.5f;
+            pat.lanes[0].mod[(size_t) gn::ModTarget::ctl1][2] = 0.25f;
+        });
+        const auto out = run (counterSignal (30000), p, bank);
+        bool ok = true;
+        for (size_t n = 0; n < 24000; ++n)
+        {
+            double expect = (double) n;                              // step 1: live
+            if (n >= 6000 && n < 12000)  expect = (double) (n - 6000);        // step 2: repeat at 0 st
+            if (n >= 12000 && n < 18000) expect = 0.5 * (double) (n - 12000); // step 3: locked to -12 st
+            if (n >= 18000)              expect = (double) (n - 18000);       // step 4: back to 0 st
+            ok &= std::abs ((double) out[n] - expect) < 0.01;
+        }
+        CHECK (ok, "pitch lock mid-tie");
+        std::printf ("  A Ctl 1 lock changes a stretched Pitch glitch on exactly that step, then it returns\n");
+    }
+
+    // Level lock on a step that fires on its own: mute it.
+    {
+        const auto bank = bankWith ([] (gn::Pattern& pat)
+        {
+            pat.lanes[0].steps[1] = gn::makeStep (T::repeat, gn::kDiv32);
+            pat.lanes[0].mod[(size_t) gn::ModTarget::level][1] = 0.0f;
+        });
+        const auto out = run (sineSignal (24000, 300.0), p, bank);
+        CHECK (rms (out, 9000, 12000) < 1.0e-6 && rms (out, 0, 6000) > 0.5, "level lock");
+        std::printf ("  A Level lock all the way down mutes that step's glitch\n");
+    }
 }
 
 int main()
@@ -1114,7 +1185,7 @@ int main()
     testSafety();
     testLiveControls();
     testFx();
-    testLayers();
+    testLanes();
 
     std::printf (gFailures == 0 ? "\nALL TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;

@@ -18,7 +18,7 @@ jobs:
     runs-on: macos-14   # Apple Silicon runner; the build itself is universal (arm64 + x86_64)
     timeout-minutes: 60
     env:
-      VERSION: 0.4.${{ github.run_number }}
+      VERSION: 0.5.${{ github.run_number }}
       ART: build-mac/GlitchNasty_artefacts/Release
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +29,13 @@ jobs:
         run: cmake -B build-mac -DCMAKE_BUILD_TYPE=Release -DGN_VERSION=${{ env.VERSION }}
 
       - name: Build
-        run: cmake --build build-mac --config Release --target GlitchNasty_AU GlitchNasty_VST3 GlitchNasty_Standalone GlitchNastyTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build-mac --config Release --target GlitchNasty_AU GlitchNasty_VST3 GlitchNasty_Standalone GlitchNastyTests GlitchNastyProcessorTests -j "$(sysctl -n hw.ncpu)"
 
       - name: Engine tests (grid timing, clicks, bypass, no audio-thread allocations)
         run: ./build-mac/GlitchNastyTests
+
+      - name: Plug-in tests (the real processor - UI edits, per-step crush levels, session save/load and old-session migration)
+        run: ./build-mac/GlitchNastyProcessorTests_artefacts/Release/GlitchNastyProcessorTests
 
       - name: Check binaries are universal
         run: |
@@ -89,7 +92,7 @@ jobs:
         run: |
           cat > notes.md <<NOTES
           **Glitch Nasty ${VERSION}**, built from ${GITHUB_SHA::7}. Universal (Apple Silicon + Intel).
-          The installer was test-installed on a Mac and passed the engine tests, Apple auval and pluginval (strictness 10).
+          The installer was test-installed on a Mac and passed the engine and plug-in tests, Apple auval and pluginval (strictness 10).
 
           **Install:** download **GlitchNasty-Installer.pkg** and double-click it.
           The first time, macOS will say it can't verify the developer (it isn't Apple-notarized yet).
@@ -118,7 +121,7 @@ jobs:
           # "latest" is replaced on every build; this one (v0.1.N) is kept forever so any
           # past version can be reinstalled. What changed = this commit's message.
           {
-            echo "**Glitch Nasty ${VERSION}**, built from ${GITHUB_SHA::7} on $(date -u +%Y-%m-%d). Passed the engine tests, Apple auval and pluginval (strictness 10)."
+            echo "**Glitch Nasty ${VERSION}**, built from ${GITHUB_SHA::7} on $(date -u +%Y-%m-%d). Passed the engine and plug-in tests, Apple auval and pluginval (strictness 10)."
             echo
             echo "### What changed"
             git log -1 --format=%B "$GITHUB_SHA" | grep -v -E '^(Co-Authored-By|Claude-Session):'

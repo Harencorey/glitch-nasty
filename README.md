@@ -1,9 +1,10 @@
 # Glitch Nasty (Norka DSP)
 
 A tempo-synced, real-time glitch/stutter plug-in. Zero latency, so it works on a live guitar as well as on tracks.
-8 patterns of 16 steps, 11 glitch types each with their own controls, per-step level/pan/filter/crush/send, ties,
-swing, steerable randomness, a crusher, tempo-synced delay and reverb, and live triggering from pads, MIDI notes
-and a footswitch.
+8 patterns of 16 steps on two lanes (lane 2 glitches lane 1's output), 11 glitch types each with their own controls,
+per-step level/pan/filter/crush/send, ties, parameter locks (change any control step by step, even in the middle of a
+stretched glitch), swing, steerable randomness, a crusher, tempo-synced delay and reverb, and live triggering from pads,
+MIDI notes and a footswitch.
 
 Coming next: presets / A-B / undo.
 
@@ -53,26 +54,40 @@ Then it's straight back to the live signal.
 ## Patterns
 
 Tabs **A–H** pick the pattern that plays and that you're editing (automatable as *Pattern*; MIDI C2–G2 also switch).
-Factory patterns: **A** basics, **B** build-up, **C** trance gate, **D** breaks, **E** pitch riser/dropper, **F** textures,
-**G** ping-pong echoes, **H** empty. Tools: **COPY / PASTE**, **< >** shift the pattern a step, **REV** reverse it,
-**CLEAR**, and **RANDOM** - roll a new pattern, keeping whatever you **LOCK** (on/off, type, repeat, chance, shape).
+Factory patterns: **A** basics, **B** build-up, **C** trance gate, **D** breaks, **E** pitch riser/dropper with lane 2
+rolling and reversing it, **F** textures, **G** ping-pong echoes, **H** a pitch melody on one bar-long glitch (locks).
+Tools: **COPY / PASTE** (the whole pattern, both lanes), **< >** shift the lane you're editing a step, **REV** reverse it,
+**CLEAR** it, and **RANDOM** - roll new steps for it, keeping whatever is ticked under **LOCKS** (on/off, type, repeat,
+chance, shape). Shift and reverse take the lane's parameter locks with them.
 
 Patterns are saved with the session. Sessions from 0.1.x open with their old steps in pattern A
 (their per-step automation lanes don't carry over - the steps are no longer separate parameters).
+Sessions from 0.4 open with their layers moved to lane 2, exactly where they were.
 
 ## Steps
 
-**Grid:** click a pad to switch a step on/off (drag to paint). Click the **type** or **repeat** box for a menu. Drag a
-**chance** bar (drag sideways to draw; double-click = 100 %). Click a step's **number** to edit it below.
+**Grid:** two rows of pads - **lane 1** (green) and **lane 2** (blue). Click a pad to switch a step on/off (drag to
+paint). Clicking anywhere on a lane's row (or the **LANE 1 / LANE 2** buttons) makes it the lane you're editing: it gets
+a frame, and the type, bar and repeat rows and the step editor below all show that lane. Click the **type** or
+**repeat** box for a menu. Click a step's **number** to edit it below. Pink = glitching right now.
 
 **Length (ties):** every on step has **[ ]** brackets at its edges - drag either one (the cursor turns into a resize
-arrow) to make the glitch last more or fewer steps. Dragging the left edge moves where it starts.
+arrow) to make the glitch last more or fewer steps. Dragging the left edge moves where it starts. Works on both lanes.
+Steps a tie covers are kept, not deleted: shrink it again and they're back.
 
-**Layers (stacking):** inside a stretched step, click any covered step to switch on a **layer** (a pink block on the
-bar). It's a second glitch that plays on top of the long one *and processes it* - e.g. Pitch down over 4 steps with a
-Roll layer on step 3 rolls the pitched-down sound, then the pitch carries on underneath. Layers have their own type,
-repeat, chance and controls (click the step number to edit; the editor says "LAYER ON STEP n"), last one step, and
-stop when the stretched step ends. Pattern **E** shows it off.
+**Lane 2 (stacking):** a second, independent sequence that runs *after* lane 1 and glitches whatever lane 1 puts out.
+Pitch down over 4 steps on lane 1 with a Roll on lane 2's step 3 rolls the pitched-down sound, then the pitch carries
+on. A lane 2 step can be stretched too (a 2-step Repeat keeps looping the pitched sound for both steps). With nothing
+on lane 1, lane 2 just glitches the input. Pattern **E** shows it off.
+
+**Bars (chance and parameter locks):** the **BARS** menu picks what the bar row draws for the lane you're editing.
+- **Chance:** how often each step fires (drag; drag sideways to draw across steps; double-click = 100 %).
+- **Ctl 1, Ctl 2, Level, Pan, Filter, Bits, Rate, Send:** *parameter locks.* Draw that parameter step by step and it
+  changes the glitch playing on each step - **including in the middle of a stretched one**, at the exact step line.
+  Ctl 1/Ctl 2 are the type's own two controls, so on a 16-step Pitch glitch Ctl 1 locks are a pitch melody (they snap to
+  semitones; switches like Reverse/Ping-Pong snap to their positions). Bits/Rate locks sequence the crusher; Level locks
+  can mute steps of a long glitch. A step without a lock uses the step's own setting (the faint line). Double-click
+  (or Alt-click) a bar to clear its lock. Pattern **H** shows it off.
 
 **Step editor:** two controls that depend on the type (knobs, or a switch when the control is a choice like
 Reverse/Ping-Pong or Speed Up/Slow Down), then **Level** (all the way down = mute), **Pan**, **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
@@ -114,13 +129,13 @@ Pad settings are saved with the session.
 | Section | Controls |
 |---|---|
 | **Crush** (global) | **Bits** (off, 16 → 1 bit), **Rate** (off, ÷1 → ÷64 sample rate, aliasing on purpose), **Mix**. Crushes the whole output, dry included. For crush on just the glitches, use Bits/Rate in the step editor. |
+| **Delay** | **Time** (tempo-synced 1/32 … 1/2, dotted and triplet), **Feedback** (soft-clipped, so high settings stay musical), **Tone** (filter in the feedback loop: darker or thinner repeats), **Ping-Pong**, **Mix** (0 = off). |
+| **Reverb** | **Size** (room → huge hall, about 0.4–9 s), **Damp** (bright → dark), **Mix** (0 = off). An 8-line feedback delay network. |
+| **Send / Feed** | **Glitches**: only the glitched audio (times each step's Send) feeds the delay and reverb, so tails spill out of the glitches while the straight signal stays dry. **Everything**: the whole output. |
 
 Both crushers quantise relative to the signal's level (a peak follower with a 250 ms release), so "4 bits" is
 4-bit crunch on a quiet guitar as much as on a loud drum bus - measured: no level drop at −6, −18 or −30 dBFS, and
 about 6 dB more crunch per bit lost.
-| **Delay** | **Time** (tempo-synced 1/32 … 1/2, dotted and triplet), **Feedback** (soft-clipped, so high settings stay musical), **Tone** (filter in the feedback loop: darker or thinner repeats), **Ping-Pong**, **Mix** (0 = off). |
-| **Reverb** | **Size** (room → huge hall, about 0.4–9 s), **Damp** (bright → dark), **Mix** (0 = off). An 8-line feedback delay network. |
-| **Send / Feed** | **Glitches**: only the glitched audio (times each step's Send) feeds the delay and reverb, so tails spill out of the glitches while the straight signal stays dry. **Everything**: the whole output. |
 
 Tails keep ringing when the transport stops. With every Mix at 0 the effects are a true bypass.
 
@@ -153,9 +168,15 @@ with that commit's notes. The version shows top-right in the plug-in window.
 - `Source/Params.h`: automatable parameter IDs (don't rename after release: it breaks sessions).
 - `Source/PluginProcessor.*`: JUCE wrapper, session save/load (and 0.1.x migration), pattern tools.
 - `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `FxPanel.*`, `Theme.h`: the UI.
-- Layers run in a second engine in series with the first (`GlitchCore.h`), so they process the tied glitch's output.
+- `Source/Format.h`: how values read on screen (shared by the knobs and the lock bars).
+- Lane 2 runs in a second engine in series with the first (`GlitchCore.h`), so it processes lane 1's output.
+  Locks are applied at the exact sample of each step line (`GlitchCore::onLaneStep`).
+- `tests/test_processor.cpp`: plug-in level tests on the real processor - per-step Bits/Rate set the way the UI sets
+  them (mono/stereo, 44.1-96 kHz, 64-1024 sample blocks, loud and quiet, both lanes, before and during playback: no
+  level drop), locks reaching the audio, session save/load of both lanes and every lock, and 0.4 session migration.
 - `tests/test_engine.cpp`: offline tests - grid/swing accuracy, every type and control, level/pan/filter, ties,
   chance/density/seed, MIDI live/quantize/pattern switch/footswitch, never-the-future across 132 setting combinations,
   click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread,
   live-pad settings, knob moves during a glitch, crusher levels/hold, delay echo timing/feedback/ping-pong,
-  glitch-only sends, reverb decay vs. design, FX bypass at mix 0.
+  glitch-only sends, reverb decay vs. design, FX bypass at mix 0, lane 2 over lane 1 (stretched too), and locks
+  changing a stretched glitch on exactly the right sample.

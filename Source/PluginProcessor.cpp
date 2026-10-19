@@ -3,7 +3,8 @@
 
 namespace
 {
-const juce::Identifier idPatterns ("PATTERNS"), idP ("P"), idS ("S"), idI ("i");
+const juce::Identifier idPatterns ("PATTERNS"), idP ("P"), idS ("S"), idI ("i"), idL ("L"), idM ("M"), idT ("t"), idV ("v"),
+                       idActiveLane ("activeLane"), idBars ("bars");
 const juce::Identifier idOn ("on"), idChance ("chance"), idDiv ("div"), idType ("type"), idLen ("len"),
                        idLevel ("level"), idPan ("pan"), idFilter ("filter"), idP1 ("p1"), idP2 ("p2"),
                        idBits ("bits"), idRate ("rate"), idSend ("send"), idLive ("LIVE");
@@ -191,10 +192,12 @@ void GlitchNastyProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     }
 
     uiPlayingStep.store (core.getPlayingStep(), std::memory_order_relaxed);
-    uiFiringStep.store (core.getFiringStep(), std::memory_order_relaxed);
-    uiFiringLen.store (core.getFiringLength(), std::memory_order_relaxed);
+    for (int l = 0; l < gn::kNumLanes; ++l)
+    {
+        uiFiringStep[(size_t) l].store (core.getFiringStep (l), std::memory_order_relaxed);
+        uiFiringLen[(size_t) l].store (core.getFiringLength (l), std::memory_order_relaxed);
+    }
     uiLiveType.store (core.getLiveType(), std::memory_order_relaxed);
-    uiLayerStep.store (core.getLayerStep(), std::memory_order_relaxed);
     uiPattern.store (core.getEffectivePattern(), std::memory_order_relaxed);
     uiEngaged.store (core.isEngaged(), std::memory_order_relaxed);
     uiEngagePending.store (core.isEngagePending(), std::memory_order_relaxed);
@@ -215,10 +218,18 @@ gn::Pattern GlitchNastyProcessor::getPattern (int pattern) const
     return bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
 }
 
-gn::StepData GlitchNastyProcessor::getStep (int pattern, int step) const
+namespace
+{
+size_t patIdx (int p)  { return (size_t) juce::jlimit (0, gn::kNumPatterns - 1, p); }
+size_t laneIdx (int l) { return (size_t) juce::jlimit (0, gn::kNumLanes - 1, l); }
+size_t stepIdx (int s) { return (size_t) juce::jlimit (0, gn::kMaxSteps - 1, s); }
+size_t modIdx (int t)  { return (size_t) juce::jlimit (0, gn::kNumModTargets - 1, t); }
+}
+
+gn::StepData GlitchNastyProcessor::getStep (int pattern, int lane, int step) const
 {
     const juce::ScopedLock sl (bankLock);
-    return bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)][(size_t) juce::jlimit (0, gn::kMaxSteps - 1, step)];
+    return bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].steps[stepIdx (step)];
 }
 
 int GlitchNastyProcessor::getEditPattern() const
@@ -243,10 +254,31 @@ void GlitchNastyProcessor::publishBank (bool notifyHost)
         updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true)); // so the host knows the session changed
 }
 
-void GlitchNastyProcessor::editStep (int pattern, int step, const std::function<void (gn::StepData&)>& change)
+void GlitchNastyProcessor::editStep (int pattern, int lane, int step, const std::function<void (gn::StepData&)>& change)
 {
     const juce::ScopedLock sl (bankLock);
-    change (bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)][(size_t) juce::jlimit (0, gn::kMaxSteps - 1, step)]);
+    change (bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].steps[stepIdx (step)]);
+    publishBank (true);
+}
+
+float GlitchNastyProcessor::getMod (int pattern, int lane, int target, int step) const
+{
+    const juce::ScopedLock sl (bankLock);
+    return bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].mod[modIdx (target)][stepIdx (step)];
+}
+
+void GlitchNastyProcessor::setMod (int pattern, int lane, int target, int step, float value)
+{
+    const juce::ScopedLock sl (bankLock);
+    bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].mod[modIdx (target)][stepIdx (step)]
+        = gn::isSet (value) ? juce::jlimit (0.0f, 1.0f, value) : gn::kModUnset;
+    publishBank (true);
+}
+
+void GlitchNastyProcessor::clearMods (int pattern, int lane, int target)
+{
+    const juce::ScopedLock sl (bankLock);
+    bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].mod[modIdx (target)].fill (gn::kModUnset);
     publishBank (true);
 }
 
@@ -266,28 +298,22 @@ void GlitchNastyProcessor::editLiveStep (int type, const std::function<void (gn:
     publishBank (true);
 }
 
-void GlitchNastyProcessor::setStepSpan (int pattern, int oldStart, int newStart, int newEnd)
+void GlitchNastyProcessor::setStepSpan (int pattern, int lane, int oldStart, int newStart, int newEnd)
 {
     const int n = getNumSteps();
     const juce::ScopedLock sl (bankLock);
-    auto& pat = bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
+    auto& steps = bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].steps;
     oldStart = juce::jlimit (0, n - 1, oldStart);
     newEnd = juce::jlimit (0, n - 1, newEnd);
     newStart = juce::jlimit (0, newEnd, newStart);
 
-    auto owner = pat[(size_t) oldStart];
-    const int oldEnd = oldStart + std::max (1, std::min (owner.length, n - oldStart)) - 1;
-
-    for (int j = oldStart + 1; j <= oldEnd; ++j) // layers left outside the new span would turn into normal steps
-        if (j < newStart || j > newEnd)
-            pat[(size_t) j].on = false;
-
+    auto owner = steps[(size_t) oldStart];
     if (newStart != oldStart)
-        pat[(size_t) oldStart].on = false; // its settings move to the new start
+        steps[(size_t) oldStart].on = false; // its settings move to the new start
 
     owner.on = true;
     owner.length = newEnd - newStart + 1;
-    pat[(size_t) newStart] = owner;
+    steps[(size_t) newStart] = owner;
     publishBank (true);
 }
 
@@ -306,55 +332,62 @@ void GlitchNastyProcessor::pastePattern (int pattern)
     publishBank (true);
 }
 
-void GlitchNastyProcessor::shiftPattern (int pattern, int direction)
+void GlitchNastyProcessor::shiftPattern (int pattern, int lane, int direction)
 {
     const int n = getNumSteps();
     const juce::ScopedLock sl (bankLock);
-    auto& pat = bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
-    if (direction > 0)
-        std::rotate (pat.begin(), pat.begin() + (n - 1), pat.begin() + n);   // everything one step later
-    else
-        std::rotate (pat.begin(), pat.begin() + 1, pat.begin() + n);         // everything one step earlier
+    auto& ln = bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)];
+    auto rot = [n, direction] (auto& arr)
+    {
+        if (direction > 0) std::rotate (arr.begin(), arr.begin() + (n - 1), arr.begin() + n); // one step later
+        else               std::rotate (arr.begin(), arr.begin() + 1, arr.begin() + n);       // one step earlier
+    };
+    rot (ln.steps);
+    for (auto& row : ln.mod) rot (row);
     publishBank (true);
 }
 
-void GlitchNastyProcessor::reversePattern (int pattern)
+void GlitchNastyProcessor::reversePattern (int pattern, int lane)
 {
     const int n = getNumSteps();
     const juce::ScopedLock sl (bankLock);
-    auto& pat = bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
-    const auto old = pat;
+    auto& ln = bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)];
+    const auto old = ln;
 
     for (int j = 0; j < n; ++j)
-        pat[(size_t) j] = old[(size_t) (n - 1 - j)];
+    {
+        ln.steps[(size_t) j] = old.steps[(size_t) (n - 1 - j)];
+        for (int t = 0; t < gn::kNumModTargets; ++t)
+            ln.mod[(size_t) t][(size_t) j] = old.mod[(size_t) t][(size_t) (n - 1 - j)];
+    }
 
     // A tie now has to start at the other end of its span.
     for (int i = 0; i < n; ++i)
     {
-        const auto& s = old[(size_t) i];
+        const auto& s = old.steps[(size_t) i];
         const int len = std::min (s.length, n - i);
         if (s.on && len > 1)
         {
-            std::swap (pat[(size_t) (n - 1 - i)], pat[(size_t) (n - 1 - (i + len - 1))]);
+            std::swap (ln.steps[(size_t) (n - 1 - i)], ln.steps[(size_t) (n - 1 - (i + len - 1))]);
             i += len - 1;
         }
     }
     publishBank (true);
 }
 
-void GlitchNastyProcessor::clearPattern (int pattern)
+void GlitchNastyProcessor::clearPattern (int pattern, int lane)
 {
     const juce::ScopedLock sl (bankLock);
-    bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)] = gn::Pattern {};
+    bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)] = gn::Lane {};
     publishBank (true);
 }
 
-void GlitchNastyProcessor::randomizePattern (int pattern, const RandomLocks& locks)
+void GlitchNastyProcessor::randomizePattern (int pattern, int lane, const RandomLocks& locks)
 {
     using T = gn::StutterType;
     const int n = getNumSteps();
     const juce::ScopedLock sl (bankLock);
-    auto& pat = bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
+    auto& pat = bank.patterns[patIdx (pattern)].lanes[laneIdx (lane)].steps;
 
     // Musically weighted: plain repeats and reverses more often than freezes.
     constexpr float typeWeights[gn::kNumStutterTypes] = { 3.0f, 2.0f, 1.5f, 1.5f, 1.5f, 1.0f, 1.0f, 1.5f, 0.7f, 1.0f, 1.0f };
@@ -366,7 +399,7 @@ void GlitchNastyProcessor::randomizePattern (int pattern, const RandomLocks& loc
         auto& s = pat[(size_t) i];
 
         if (! locks.onOff)
-            s.on = random.nextFloat() < 0.4f;
+            s.on = random.nextFloat() < (lane == 0 ? 0.4f : 0.2f); // lane 2 sparser: it's the seasoning
 
         if (! locks.type)
         {
@@ -407,13 +440,40 @@ void GlitchNastyProcessor::randomizePattern (int pattern, const RandomLocks& loc
 // Session state: the parameters, plus every pattern as a PATTERNS child.
 juce::ValueTree GlitchNastyProcessor::patternsToTree (const gn::PatternBank& b) const
 {
+    // PATTERNS > P(i) > L(i) > S(i) steps + M(t, v = comma-separated locks, "" = none)
     juce::ValueTree root (idPatterns);
+    root.setProperty (idActiveLane, activeLane, nullptr);
+    root.setProperty (idBars, barsTarget, nullptr);
     for (int p = 0; p < gn::kNumPatterns; ++p)
     {
         juce::ValueTree pt (idP);
         pt.setProperty (idI, p, nullptr);
-        for (int i = 0; i < gn::kMaxSteps; ++i)
-            pt.appendChild (stepToTree (b.patterns[(size_t) p][(size_t) i], i), nullptr);
+        for (int l = 0; l < gn::kNumLanes; ++l)
+        {
+            const auto& ln = b.patterns[(size_t) p].lanes[(size_t) l];
+            juce::ValueTree lt (idL);
+            lt.setProperty (idI, l, nullptr);
+            for (int i = 0; i < gn::kMaxSteps; ++i)
+                lt.appendChild (stepToTree (ln.steps[(size_t) i], i), nullptr);
+            for (int t = 0; t < gn::kNumModTargets; ++t)
+            {
+                bool any = false;
+                juce::StringArray vals;
+                for (int i = 0; i < gn::kMaxSteps; ++i)
+                {
+                    const float v = ln.mod[(size_t) t][(size_t) i];
+                    any |= gn::isSet (v);
+                    vals.add (gn::isSet (v) ? juce::String (v, 4) : juce::String());
+                }
+                if (! any)
+                    continue;
+                juce::ValueTree mt (idM);
+                mt.setProperty (idT, t, nullptr);
+                mt.setProperty (idV, vals.joinIntoString (","), nullptr);
+                lt.appendChild (mt, nullptr);
+            }
+            pt.appendChild (lt, nullptr);
+        }
         root.appendChild (pt, nullptr);
     }
 
@@ -424,21 +484,77 @@ juce::ValueTree GlitchNastyProcessor::patternsToTree (const gn::PatternBank& b) 
     return root;
 }
 
+void GlitchNastyProcessor::migrateLayersToLane2 (gn::Pattern& pat)
+{
+    auto& l1 = pat.lanes[0].steps;
+    auto& l2 = pat.lanes[1].steps;
+    for (int i = 0; i < gn::kMaxSteps; ++i)
+    {
+        const int len = std::max (1, std::min (l1[(size_t) i].length, gn::kMaxSteps - i));
+        if (! l1[(size_t) i].on || len < 2)
+            continue;
+        for (int j = i + 1; j < i + len; ++j)
+            if (l1[(size_t) j].on)
+            {
+                l2[(size_t) j] = l1[(size_t) j];
+                l2[(size_t) j].length = 1;  // 0.4 layers always lasted one step
+                l1[(size_t) j] = gn::StepData {};
+            }
+        i += len - 1;
+    }
+}
+
 void GlitchNastyProcessor::patternsFromTree (const juce::ValueTree& root, gn::PatternBank& b)
 {
     b = gn::PatternBank {};
+    activeLane = juce::jlimit (0, gn::kNumLanes - 1, (int) root.getProperty (idActiveLane, 0));
+    barsTarget = juce::jlimit (-1, gn::kNumModTargets - 1, (int) root.getProperty (idBars, -1));
+
     for (const auto& pt : root)
     {
         const int p = pt.getProperty (idI, -1);
         if (! pt.hasType (idP) || p < 0 || p >= gn::kNumPatterns)
             continue;
-        for (const auto& st : pt)
+        auto& pat = b.patterns[(size_t) p];
+        bool oldFormat = false;
+
+        for (const auto& child : pt)
         {
-            const int i = st.getProperty (idI, -1);
-            if (! st.hasType (idS) || i < 0 || i >= gn::kMaxSteps)
+            if (child.hasType (idS)) // 0.2 - 0.4: steps straight under P = lane 1
+            {
+                const int i = child.getProperty (idI, -1);
+                if (i >= 0 && i < gn::kMaxSteps)
+                    stepFromTree (child, pat.lanes[0].steps[(size_t) i]);
+                oldFormat = true;
                 continue;
-            stepFromTree (st, b.patterns[(size_t) p][(size_t) i]);
+            }
+            const int l = child.getProperty (idI, -1);
+            if (! child.hasType (idL) || l < 0 || l >= gn::kNumLanes)
+                continue;
+            auto& ln = pat.lanes[(size_t) l];
+            for (const auto& st : child)
+            {
+                if (st.hasType (idS))
+                {
+                    const int i = st.getProperty (idI, -1);
+                    if (i >= 0 && i < gn::kMaxSteps)
+                        stepFromTree (st, ln.steps[(size_t) i]);
+                }
+                else if (st.hasType (idM))
+                {
+                    const int t = st.getProperty (idT, -1);
+                    if (t < 0 || t >= gn::kNumModTargets)
+                        continue;
+                    const auto vals = juce::StringArray::fromTokens (st.getProperty (idV).toString(), ",", "");
+                    for (int i = 0; i < juce::jmin (vals.size(), gn::kMaxSteps); ++i)
+                        ln.mod[(size_t) t][(size_t) i] = vals[i].trim().isEmpty() ? gn::kModUnset
+                                                                                 : juce::jlimit (0.0f, 1.0f, vals[i].getFloatValue());
+                }
+            }
         }
+
+        if (oldFormat)
+            migrateLayersToLane2 (pat);
     }
 
     // Live pad settings (sessions from before 0.3 keep the factory pads).

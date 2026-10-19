@@ -57,7 +57,7 @@ private:
     FxPanel fxPanel;
 
     std::vector<double> tapTimes;
-    int blink = 0;
+    int blink = 0, shownLane = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GlitchNastyEditor)
 };

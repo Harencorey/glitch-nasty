@@ -1,5 +1,12 @@
 #include "PatternBar.h"
 
+namespace
+{
+const char* const kLockNames[5] = { "On/off", "Type", "Repeat", "Chance", "Shape" };
+const char* const kLockTips[5] = { "which steps are on", "each step's type", "each step's repeat length",
+                                   "each step's chance", "each step's controls, length, level, pan and filter" };
+} // namespace
+
 PatternBar::PatternBar (GlitchNastyProcessor& p) : processor (p)
 {
     using namespace gn::colours;
@@ -16,47 +23,84 @@ PatternBar::PatternBar (GlitchNastyProcessor& p) : processor (p)
         addAndMakeVisible (t);
     }
 
+    for (int l = 0; l < gn::kNumLanes; ++l)
+    {
+        auto& t = laneTabs[(size_t) l];
+        t.setButtonText ("LANE " + juce::String (l + 1));
+        t.setClickingTogglesState (false);
+        t.setColour (juce::TextButton::buttonOnColourId, l == 0 ? acid : lane2);
+        t.setColour (juce::TextButton::textColourOnId, background);
+        t.setColour (juce::TextButton::textColourOffId, l == 0 ? acid : lane2);
+        t.setTooltip (l == 0 ? "Edit lane 1, the main sequence (or click its row on the grid)."
+                             : "Edit lane 2: a second sequence that glitches lane 1's output, so its glitches stack on top "
+                               "(or click its row on the grid).");
+        t.setConnectedEdges (l == 0 ? juce::Button::ConnectedOnRight : juce::Button::ConnectedOnLeft);
+        t.onClick = [this, l] { processor.setActiveLane (l); };
+        addAndMakeVisible (t);
+    }
+
+    barsBox.addItem ("Chance", 1);
+    barsBox.addSeparator();
+    barsBox.addSectionHeading ("Locks (per step)");
+    for (int t = 0; t < gn::kNumModTargets; ++t)
+        barsBox.addItem (gn::kModTargetNames[t], t + 2);
+    barsBox.setTooltip ("What the bars under the grid draw. Chance: how often each step fires. Anything else: a parameter lock - "
+                        "draw that parameter step by step and it changes the glitch playing on each step, even in the middle of "
+                        "a stretched one (e.g. Ctl 1 on a long Pitch step = a pitch melody). Ctl 1 / Ctl 2 are the step type's "
+                        "own two controls. Double-click a bar to clear its lock.");
+    barsBox.onChange = [this] { processor.setBarsTarget (barsBox.getSelectedId() - 2); };
+    addAndMakeVisible (barsBox);
+
     auto tool = [this] (juce::TextButton& b, const juce::String& tip, std::function<void()> fn)
     {
         b.setTooltip (tip);
         b.onClick = std::move (fn);
         addAndMakeVisible (b);
     };
-    tool (copyButton, "Copy this pattern.", [this] { processor.copyPattern (processor.getEditPattern()); });
-    tool (pasteButton, "Paste the copied pattern over this one.", [this] { processor.pastePattern (processor.getEditPattern()); });
-    tool (leftButton, "Shift the whole pattern one step earlier.", [this] { processor.shiftPattern (processor.getEditPattern(), -1); });
-    tool (rightButton, "Shift the whole pattern one step later.", [this] { processor.shiftPattern (processor.getEditPattern(), +1); });
-    tool (reverseButton, "Reverse the order of the steps.", [this] { processor.reversePattern (processor.getEditPattern()); });
-    tool (clearButton, "Switch every step off and reset it.", [this] { processor.clearPattern (processor.getEditPattern()); });
-    tool (randomButton, "Roll a new random pattern. Anything locked (to the right) is kept.", [this]
+    auto pat = [this] { return processor.getEditPattern(); };
+    auto lane = [this] { return processor.getActiveLane(); };
+    tool (copyButton, "Copy this pattern (both lanes and their locks).", [this, pat] { processor.copyPattern (pat()); });
+    tool (pasteButton, "Paste the copied pattern over this one.", [this, pat] { processor.pastePattern (pat()); });
+    tool (leftButton, "Shift the lane you're editing one step earlier (locks move with it).", [this, pat, lane] { processor.shiftPattern (pat(), lane(), -1); });
+    tool (rightButton, "Shift the lane you're editing one step later (locks move with it).", [this, pat, lane] { processor.shiftPattern (pat(), lane(), +1); });
+    tool (reverseButton, "Reverse the order of the steps in the lane you're editing.", [this, pat, lane] { processor.reversePattern (pat(), lane()); });
+    tool (clearButton, "Switch every step of the lane you're editing off and clear its locks.", [this, pat, lane] { processor.clearPattern (pat(), lane()); });
+    tool (randomButton, "Roll new random steps for the lane you're editing. Anything ticked under LOCKS is kept.", [this, pat, lane]
     {
         GlitchNastyProcessor::RandomLocks l;
-        l.onOff  = locks[0].getToggleState();
-        l.type   = locks[1].getToggleState();
-        l.repeat = locks[2].getToggleState();
-        l.chance = locks[3].getToggleState();
-        l.shape  = locks[4].getToggleState();
-        processor.randomizePattern (processor.getEditPattern(), l);
+        l.onOff  = locks[0];
+        l.type   = locks[1];
+        l.repeat = locks[2];
+        l.chance = locks[3];
+        l.shape  = locks[4];
+        processor.randomizePattern (pat(), lane(), l);
     });
     randomButton.setColour (juce::TextButton::textColourOffId, nasty);
-
-    const char* lockNames[5] = { "ON/OFF", "TYPE", "REPEAT", "CHANCE", "SHAPE" };
-    const char* lockTips[5] = { "Keep which steps are on.", "Keep each step's type.", "Keep each step's repeat length.",
-                                "Keep each step's chance.", "Keep each step's controls, length, level, pan and filter." };
-    for (int i = 0; i < 5; ++i)
-    {
-        auto& l = locks[(size_t) i];
-        l.setButtonText (lockNames[i]);
-        l.setClickingTogglesState (true);
-        l.setTooltip ("Lock: " + juce::String (lockTips[i]) + " RANDOM won't change it.");
-        l.setColour (juce::TextButton::buttonOnColourId, nasty);
-        l.setColour (juce::TextButton::textColourOnId, background);
-        l.getProperties().set ("small", true);
-        addAndMakeVisible (l);
-    }
+    tool (locksButton, "What RANDOM keeps as it is.", [this] { showLocksMenu(); });
 
     startTimerHz (15);
     timerCallback();
+}
+
+void PatternBar::showLocksMenu()
+{
+    juce::PopupMenu menu;
+    menu.addSectionHeader ("RANDOM keeps...");
+    for (int i = 0; i < 5; ++i)
+        menu.addItem (i + 1, juce::String (kLockNames[i]) + "  (" + kLockTips[i] + ")", true, locks[(size_t) i]);
+
+    juce::Component::SafePointer<PatternBar> safe (this);
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&locksButton),
+                        [safe] (int r)
+                        {
+                            if (safe == nullptr || r <= 0)
+                                return;
+                            safe->locks[(size_t) r - 1] = ! safe->locks[(size_t) r - 1];
+                            int n = 0;
+                            for (bool b : safe->locks) n += b ? 1 : 0;
+                            safe->locksButton.setButtonText (n > 0 ? "LOCKS " + juce::String (n) : juce::String ("LOCKS"));
+                            safe->showLocksMenu(); // stay open-ish: tick several in a row
+                        });
 }
 
 void PatternBar::selectPattern (int p)
@@ -79,6 +123,17 @@ void PatternBar::timerCallback()
         shownPlaying = playing;
         repaint();
     }
+    if (processor.getActiveLane() != shownLane)
+    {
+        shownLane = processor.getActiveLane();
+        for (int l = 0; l < gn::kNumLanes; ++l)
+            laneTabs[(size_t) l].setToggleState (l == shownLane, juce::dontSendNotification);
+    }
+    if (processor.getBarsTarget() != shownBars)
+    {
+        shownBars = processor.getBarsTarget();
+        barsBox.setSelectedId (shownBars + 2, juce::dontSendNotification);
+    }
     pasteButton.setEnabled (processor.hasClipboard());
 }
 
@@ -88,9 +143,7 @@ void PatternBar::paint (juce::Graphics& g)
     g.setColour (dimText);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
     g.drawText ("PATTERN", getLocalBounds().removeFromLeft (64), juce::Justification::centredLeft);
-
-    const auto lockLabel = locks[0].getBounds().withWidth (40).translated (-44, 0);
-    g.drawText ("LOCK", lockLabel, juce::Justification::centredRight);
+    g.drawText ("BARS", barsBox.getBounds().withWidth (40).translated (-42, 0), juce::Justification::centredRight);
 
     // A pink dot under the tab that MIDI switched to (when it isn't the one you're editing).
     if (shownPlaying >= 0 && shownPlaying != shownPattern)
@@ -106,18 +159,20 @@ void PatternBar::resized()
     auto r = getLocalBounds();
     r.removeFromLeft (64);
     for (auto& t : tabs)
-        t.setBounds (r.removeFromLeft (30));
-
-    r.removeFromLeft (16);
-    for (auto* b : { &copyButton, &pasteButton, &leftButton, &rightButton, &reverseButton, &clearButton })
-    {
-        b->setBounds (r.removeFromLeft (b == &leftButton || b == &rightButton ? 34 : 56).reduced (2, 0));
-    }
+        t.setBounds (r.removeFromLeft (28));
 
     r.removeFromLeft (14);
-    randomButton.setBounds (r.removeFromLeft (80).reduced (2, 0));
+    for (auto& t : laneTabs)
+        t.setBounds (r.removeFromLeft (62));
 
-    r.removeFromLeft (44);
-    for (auto& l : locks)
-        l.setBounds (r.removeFromLeft (60).reduced (2, 0));
+    r.removeFromLeft (46);
+    barsBox.setBounds (r.removeFromLeft (100).reduced (0, 1));
+
+    // Tools on the right.
+    auto right = r;
+    locksButton.setBounds (right.removeFromRight (66).reduced (2, 0));
+    randomButton.setBounds (right.removeFromRight (76).reduced (2, 0));
+    right.removeFromRight (8);
+    for (auto* b : { &clearButton, &reverseButton, &rightButton, &leftButton, &pasteButton, &copyButton })
+        b->setBounds (right.removeFromRight (b == &leftButton || b == &rightButton ? 30 : 54).reduced (2, 0));
 }

@@ -54,9 +54,10 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
     addAndMakeVisible (fxPanel);
 
     // The editor follows whatever you clicked last: a step number or a live pad.
-    grid.onStepSelected = [this] (int s)
+    grid.onStepSelected = [this] (int lane, int s)
     {
-        stepEditor.setStep (s);
+        stepEditor.setStep (lane, s);
+        shownLane = lane;
         livePanel.setSelectedPad (-1);
     };
     livePanel.onPadSelected = [this] (int type)
@@ -64,10 +65,11 @@ GlitchNastyEditor::GlitchNastyEditor (GlitchNastyProcessor& p)
         stepEditor.setLivePad (type);
         grid.setSelectedStep (-1);
     };
+    shownLane = processor.getActiveLane();
     grid.setSelectedStep (3);
-    stepEditor.setStep (3);
+    stepEditor.setStep (shownLane, 3);
 
-    setSize (1100, 884);
+    setSize (1100, 912);
     startTimerHz (10);
 }
 
@@ -150,6 +152,14 @@ void GlitchNastyEditor::timerCallback()
     if (engageStatus.getText() != status)
         engageStatus.setText (status, juce::dontSendNotification);
     engageStatus.setColour (juce::Label::textColourId, colour);
+
+    // LANE 1 / LANE 2 buttons: the step editor follows the lane.
+    if (processor.getActiveLane() != shownLane)
+    {
+        shownLane = processor.getActiveLane();
+        if (! stepEditor.isEditingLivePad())
+            stepEditor.setStep (shownLane, juce::jmax (0, grid.getSelectedStep()));
+    }
 }
 
 //==============================================================================
@@ -210,7 +220,7 @@ void GlitchNastyEditor::resized()
     area.removeFromTop (8);
     patternBar.setBounds (area.removeFromTop (28));
     area.removeFromTop (10);
-    grid.setBounds (area.removeFromTop (262));
+    grid.setBounds (area.removeFromTop (290));
     area.removeFromTop (12);
 
     auto bottom = area.removeFromTop (226);
