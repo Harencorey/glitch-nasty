@@ -18,7 +18,7 @@ class StepEditor : public juce::Component,
 public:
     explicit StepEditor (GlitchNastyProcessor&);
 
-    void setStep (int newStep);    // edit a step of the current pattern
+    void setStep (int newStep);    // edit a step of the current pattern (or a layer inside a tie)
     void setLivePad (int type);    // edit a live pad's settings
     bool isEditingLivePad() const noexcept { return liveTarget; }
 
@@ -26,7 +26,7 @@ public:
     void resized() override;
 
 private:
-    enum { kCtl1, kCtl2, kLength, kLevel, kPan, kFilter, kBits, kRate, kSend, kNumKnobs };
+    enum { kCtl1, kCtl2, kLevel, kPan, kFilter, kBits, kRate, kSend, kNumKnobs };
 
     void timerCallback() override;
     void refresh (bool force);
@@ -39,6 +39,7 @@ private:
 
     GlitchNastyProcessor& processor;
     std::array<gn::ui::Knob, kNumKnobs> knobs;
+    std::array<gn::ui::ChoiceSwitch, 2> switches; // shown instead of CTL knobs when the control is a choice
     int step = 0, liveType = 0;
     bool liveTarget = false;
     int shownType = -1, shownPattern = -1, shownStep = -1;

@@ -23,14 +23,26 @@ namespace gn
 class Crusher
 {
 public:
+    void prepare (double sampleRate) noexcept
+    {
+        envRelease = (float) std::exp (-1.0 / (0.25 * sampleRate)); // 250 ms release
+        reset();
+    }
+
     void reset() noexcept
     {
         held = {};
         counter = 1.0e9; // grab a new sample straight away
+        env = 0.0f;
     }
 
     // One stereo frame in place. factor = sample-rate divider (1 = off),
     // bits = bit depth (>= 23.5 = off). Bits are continuous so a sweep is smooth.
+    //
+    // The quantiser follows the signal's level (a peak envelope, instant attack,
+    // 250 ms release): "4 bits" means 4 bits of the sound that's actually there,
+    // so a quiet guitar crunches like a loud drum bus instead of rounding to
+    // silence - like riding the input gain of an old sampler to hit it hard.
     void processFrame (float* frame, int numCh, double factor, double bits) noexcept
     {
         if (factor > 1.0001)
@@ -49,9 +61,14 @@ public:
             counter = 1.0e9;
         }
 
-        if (bits < 23.5)
+        float peak = 0.0f;
+        for (int c = 0; c < numCh; ++c)
+            peak = std::max (peak, std::abs (frame[c]));
+        env = std::max (peak, env * envRelease);
+
+        if (bits < 23.5 && env > 1.0e-5f) // true silence stays silent
         {
-            const float q = (float) std::exp2 (std::max (1.0, bits) - 1.0); // levels per unit
+            const float q = (float) std::exp2 (std::max (1.0, bits) - 1.0) / env; // levels per unit of the current level
             for (int c = 0; c < numCh; ++c)
                 frame[c] = std::round (frame[c] * q) / q;
         }
@@ -60,6 +77,7 @@ public:
 private:
     std::array<float, 2> held {};
     double counter = 1.0e9;
+    float env = 0.0f, envRelease = 0.9999f;
 };
 
 //==============================================================================

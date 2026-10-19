@@ -97,17 +97,23 @@ public:
         sr = sampleRate;
         channels = std::clamp (numChannels, 1, 2);
         engine.prepare (numChannels, sampleRate, kBufferSeconds);
+        layer.prepare (numChannels, sampleRate, kBufferSeconds);
         delay.prepare (sampleRate, 6.5);
         reverb.prepare (sampleRate);
-        for (auto* v : { &sendBuf, &delayOut, &reverbOut })
+        globalCrusher.prepare (sampleRate);
+        for (auto* v : { &sendBuf, &layerSendBuf, &delayOut, &reverbOut })
             for (auto& ch : *v)
                 ch.assign ((size_t) kMaxChunk, 0.0f);
+        layerActBuf.assign ((size_t) kMaxChunk, 0.0f);
         reset();
     }
 
     void reset()
     {
         engine.reset();
+        layer.reset();
+        layerStep = -1;
+        tiePattern = 0;
         stepSched.reset();
         barSched.reset();
         quantSched.reset();
@@ -168,6 +174,7 @@ private:
         params = &p;
         bankPtr = &bank;
         engine.setMix (p.mix);
+        layer.setMix (1.0f); // the layer works on the glitch's output; Mix is applied once, by the first engine
 
         // ---- Clock ---------------------------------------------------------
         hostClock = (p.syncMode == 0 && host.hasPpq && host.hasBpm);
@@ -228,6 +235,7 @@ private:
                 handleMidi (midi[m], false);
             engaged = engageTarget;
             engine.stopStutter (fade);
+            stopLayer();
             liveType = pendingLive = -1;
             tieRemaining = 0;
             stepSched.reset();
@@ -235,7 +243,7 @@ private:
             quantSched.reset();
             playingStep = firingStep = -1;
             liveChanged = true; // re-check held notes when playback starts
-            engine.process (io, numCh, 0, numSamples, sendPtrs());
+            runEngines (io, numCh, 0, numSamples);
             applyFx (io, numCh, numSamples); // tails keep ringing while stopped
             return;
         }
@@ -256,6 +264,7 @@ private:
         if (resynced)
         {
             engine.stopStutter (fade);
+            stopLayer();
             firingStep = -1;
             tieRemaining = 0;
             liveType = pendingLive = -1;
@@ -279,6 +288,12 @@ private:
             if (s.type == firingType)
                 engine.updateControls (controlsOf (s));
         }
+        if (layerStep >= 0)
+        {
+            const auto& s = bank.patterns[(size_t) tiePattern][(size_t) layerStep];
+            if (s.type == layerType)
+                layer.updateControls (controlsOf (s));
+        }
 
         // ---- Walk the block in time order ----------------------------------
         // At the same sample: MIDI first, then bar lines, then steps, then
@@ -299,7 +314,7 @@ private:
             if (which < 0)
                 break;
 
-            engine.process (io, numCh, cursor, next - cursor, sendPtrs());
+            runEngines (io, numCh, cursor, next - cursor);
             cursor = next;
 
             switch (which)
@@ -310,7 +325,7 @@ private:
                 default: onQuant (quantEvents[(size_t) iq++]); break;
             }
         }
-        engine.process (io, numCh, cursor, numSamples - cursor, sendPtrs());
+        runEngines (io, numCh, cursor, numSamples - cursor);
         applyFx (io, numCh, numSamples);
     }
 
@@ -320,6 +335,7 @@ public:
     int getFiringStep() const noexcept        { return firingStep; }
     int getFiringLength() const noexcept      { return firingLen; }
     int getLiveType() const noexcept          { return liveType; }
+    int getLayerStep() const noexcept         { return layerStep; }
     int getEffectivePattern() const noexcept  { return currentPatternIndex(); }
     bool isEngaged() const noexcept           { return engaged; }
     bool isEngagePending() const noexcept     { return engaged != engageTarget; }
@@ -366,8 +382,11 @@ private:
         if (tieRemaining > 0) // still inside a tied glitch
         {
             --tieRemaining;
+            onLayerStep (ev, idx);
             return;
         }
+
+        stopLayer(); // layers only live inside the tie that holds them
 
         if (liveType >= 0) // live notes/pads override the pattern
             return;
@@ -387,6 +406,7 @@ private:
 
         const int len = std::clamp (s.length, 1, numSteps - idx);
         tieRemaining = len - 1; // the following steps belong to this one, fire or not
+        tiePattern = currentPatternIndex();
 
         const float chance = applyDensity (s.chance, params->density);
         const float dice = rand01 (seedBase, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
@@ -423,7 +443,61 @@ private:
     void stopPattern() noexcept
     {
         engine.stopStutter (fade);
+        stopLayer();
         firingStep = -1;
+    }
+
+    void stopLayer() noexcept
+    {
+        layer.stopStutter (fade);
+        layerStep = -1;
+    }
+
+    // A step inside a tie that's switched on: its glitch stacks on top of the
+    // tied one (a second engine working on the first one's output), for one step.
+    void onLayerStep (const GridEvent& ev, int idx) noexcept
+    {
+        if (liveType >= 0 || ! engaged)
+        {
+            stopLayer();
+            return;
+        }
+
+        const StepData& s = bankPtr->patterns[(size_t) tiePattern][(size_t) idx];
+        const float chance = applyDensity (s.chance, params->density);
+        const float dice = rand01 (seedBase ^ 0x51ED27u, (uint32_t) ev.step, (uint32_t) ((uint64_t) ev.step >> 32));
+        if (! s.on || ! (chance >= 0.999f || dice < chance))
+        {
+            stopLayer();
+            return;
+        }
+
+        StutterSettings st;
+        st.type = (StutterType) std::clamp (s.type, 0, kNumStutterTypes - 1);
+        st.sliceLen = kDivisionPpq[std::clamp (s.division, 0, kNumDivisions - 1)] * spq;
+        st.stepLen = (GridScheduler::stepStart (ev.step + 1, swing) - GridScheduler::stepStart (ev.step, swing)) * samplesPerStep;
+        st.lateBy = ev.lateBy;
+        st.minPeriod = spq / 32.0;
+        st.fadeSamples = fade;
+        st.p1 = s.p1;
+        st.p2 = s.p2;
+        st.level = levelGain (s.levelDb);
+        st.pan = s.pan;
+        st.filter = s.filter;
+        st.bits = s.bits;
+        st.rate = s.rate;
+        st.send = s.send;
+        st.seed = hash32 (seedBase ^ hash32 ((uint32_t) ev.step + 0x2545F491u));
+        layer.startStutter (st);
+        layerStep = idx;
+        layerType = s.type;
+    }
+
+    void runEngines (float* const* io, int numCh, int start, int num) noexcept
+    {
+        engine.process (io, numCh, start, num, sendPtrs());
+        float* ls[2] = { layerSendBuf[0].data(), layerSendBuf[1].data() };
+        layer.process (io, numCh, start, num, ls, layerActBuf.data());
     }
 
     void onBar() noexcept
@@ -565,6 +639,7 @@ private:
         st.send = pad.send;
         st.seed = hash32 (seedBase ^ (0xA5A5A5A5u + ++liveCounter));
         engine.startStutter (st);
+        stopLayer();
 
         liveType = type;
         firingStep = -1;
@@ -624,6 +699,13 @@ private:
         if (! runDelay && ! runReverb)
             return;
 
+        // While a layer plays, the effects hear the layered sound instead of the tied glitch under it.
+        if (p.fxSource == 0)
+            for (int c = 0; c < numCh; ++c)
+                for (int i = 0; i < numSamples; ++i)
+                    sendBuf[(size_t) c][(size_t) i] = sendBuf[(size_t) c][(size_t) i] * (1.0f - layerActBuf[(size_t) i])
+                                                      + layerSendBuf[(size_t) c][(size_t) i];
+
         const float* src[2] = { p.fxSource == 1 ? io[0] : sendBuf[0].data(),
                                 p.fxSource == 1 ? (numCh > 1 ? io[1] : io[0]) : sendBuf[1].data() };
         float* dOut[2] = { delayOut[0].data(), delayOut[1].data() };
@@ -651,11 +733,13 @@ private:
     }
 
     //--------------------------------------------------------------------------
-    StutterEngine engine;
+    StutterEngine engine, layer;
     TempoDelay delay;
     Reverb reverb;
     Crusher globalCrusher;
-    std::array<std::vector<float>, 2> sendBuf, delayOut, reverbOut;
+    std::array<std::vector<float>, 2> sendBuf, layerSendBuf, delayOut, reverbOut;
+    std::vector<float> layerActBuf;
+    int layerStep = -1, layerType = -1, tiePattern = 0;
     float* sendPtrArray[2] {};
     std::array<MidiEvent, 512> chunkMidi {};
     int channels = 2;

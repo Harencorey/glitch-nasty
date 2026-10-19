@@ -115,4 +115,69 @@ struct Knob
         slider.setBounds (r.reduced (2, 0));
     }
 };
+
+// A 2- or 3-position switch (for controls that are really a choice, not a range):
+// the positions stacked vertically, click one to pick it.
+class ChoiceSwitch : public juce::Component,
+                     public juce::SettableTooltipClient
+{
+public:
+    std::function<void (int)> onChange;
+
+    void setChoices (const juce::StringArray& c)
+    {
+        choices = c;
+        index = juce::jlimit (0, juce::jmax (0, choices.size() - 1), index);
+        repaint();
+    }
+
+    void setIndex (int i)
+    {
+        i = juce::jlimit (0, juce::jmax (0, choices.size() - 1), i);
+        if (i != index) { index = i; repaint(); }
+    }
+
+    int getIndex() const noexcept { return index; }
+
+    void paint (juce::Graphics& g) override
+    {
+        using namespace colours;
+        const int n = juce::jmax (1, choices.size());
+        auto area = getLocalBounds().toFloat().withSizeKeepingCentre (juce::jmin ((float) getWidth() - 4.0f, 80.0f),
+                                                                     juce::jmin ((float) getHeight() - 4.0f, 26.0f * (float) n));
+        const float h = area.getHeight() / (float) n;
+        for (int i = 0; i < n; ++i)
+        {
+            auto seg = area.withHeight (h).withY (area.getY() + h * (float) i).reduced (0.0f, 1.5f);
+            const bool on = i == index;
+            g.setColour (on ? accent : raised);
+            g.fillRoundedRectangle (seg, 4.0f);
+            g.setColour (on ? accent.brighter (0.2f) : outline);
+            g.drawRoundedRectangle (seg, 4.0f, 1.0f);
+            g.setColour (on ? background : (isEnabled() ? text : dimText));
+            g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+            g.drawText (choices[i].toUpperCase(), seg, juce::Justification::centred);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const int n = juce::jmax (1, choices.size());
+        const auto area = getLocalBounds().toFloat().withSizeKeepingCentre (juce::jmin ((float) getWidth() - 4.0f, 80.0f),
+                                                                           juce::jmin ((float) getHeight() - 4.0f, 26.0f * (float) n));
+        const int i = juce::jlimit (0, n - 1, (int) ((e.position.y - area.getY()) / (area.getHeight() / (float) n)));
+        if (i != index)
+        {
+            index = i;
+            repaint();
+            if (onChange) onChange (index);
+        }
+    }
+
+    juce::Colour accent = colours::nasty;
+
+private:
+    juce::StringArray choices;
+    int index = 0;
+};
 } // namespace gn::ui

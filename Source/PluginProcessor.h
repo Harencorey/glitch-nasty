@@ -52,6 +52,9 @@ public:
     void editStep (int pattern, int step, const std::function<void (gn::StepData&)>& change);
     gn::StepData getLiveStep (int type) const;
     void editLiveStep (int type, const std::function<void (gn::StepData&)>& change);
+    // Drag a step's edges: it now spans newStart..newEnd. Moving the start moves the
+    // step's settings with it; layers that fall outside the new span are switched off.
+    void setStepSpan (int pattern, int oldStart, int newStart, int newEnd);
     void copyPattern (int pattern);
     void pastePattern (int pattern);
     bool hasClipboard() const noexcept { return clipboardValid; }
@@ -69,7 +72,7 @@ public:
     std::atomic<int> livePad { -1 };
 
     // Audio thread -> UI (read on a timer, never blocks either side).
-    std::atomic<int> uiPlayingStep { -1 }, uiFiringStep { -1 }, uiFiringLen { 1 }, uiLiveType { -1 }, uiPattern { 0 };
+    std::atomic<int> uiPlayingStep { -1 }, uiFiringStep { -1 }, uiFiringLen { 1 }, uiLiveType { -1 }, uiPattern { 0 }, uiLayerStep { -1 };
     std::atomic<bool> uiEngaged { true }, uiEngagePending { false }, uiHostClock { false };
     std::atomic<float> uiBpm { 120.0f };
 

@@ -22,7 +22,6 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
 
     knobs[kCtl1].setup (*this, "CTL 1", {});
     knobs[kCtl2].setup (*this, "CTL 2", {});
-    knobs[kLength].setup (*this, "LENGTH", "How many steps this glitch lasts. Above 1, it ties over the following steps (they're skipped).");
     knobs[kLevel].setup (*this, "LEVEL", "Level of this glitch. All the way down = silent (a mute step).");
     knobs[kPan].setup (*this, "PAN", "Where this glitch sits in the stereo field.");
     knobs[kFilter].setup (*this, "FILTER", "Left = low-pass (down to 200 Hz), right = high-pass (up to 4 kHz), centre = off. Only on the glitch, never the dry signal.");
@@ -32,16 +31,6 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
 
     for (int k : { kCtl1, kCtl2 })
         knobs[(size_t) k].slider.setColour (juce::Slider::rotarySliderFillColourId, nasty);
-
-    auto& len = knobs[kLength].slider;
-    len.setRange (1.0, gn::kMaxSteps, 1.0);
-    len.setDoubleClickReturnValue (true, 1.0);
-    len.textFromValueFunction = [this] (double v)
-    {
-        if (liveTarget) return juce::String ("while held");
-        const int n = juce::roundToInt (v);
-        return juce::String (n) + (n == 1 ? " step" : " steps");
-    };
 
     auto& lvl = knobs[kLevel].slider;
     lvl.setRange (gn::kLevelMinDb, gn::kLevelMaxDb, 0.1);
@@ -91,6 +80,19 @@ StepEditor::StepEditor (GlitchNastyProcessor& p) : processor (p)
     for (int k = 0; k < kNumKnobs; ++k)
         knobs[(size_t) k].slider.onValueChange = [this, k] { if (! updating) knobChanged (k); };
 
+    for (int w = 0; w < 2; ++w)
+    {
+        addChildComponent (switches[(size_t) w]);
+        switches[(size_t) w].onChange = [this, w] (int index)
+        {
+            const auto& tc = typeControl (w == 0 ? kCtl1 : kCtl2);
+            const float value = tc.numChoices > 1 ? (float) index / (float) (tc.numChoices - 1) : 0.0f;
+            editTarget ([w, value] (gn::StepData& st) { if (w == 0) st.p1 = value; else st.p2 = value; });
+            knobs[kCtl1].slider.updateText();
+            knobs[kCtl2].slider.updateText();
+        };
+    }
+
     refresh (true);
     startTimerHz (15);
 }
@@ -138,6 +140,17 @@ void StepEditor::configureTypeKnob (int which, int type)
     k.label.setTooltip (k.slider.getTooltip());
 
     const float def = which == kCtl1 ? info.p1Default : info.p2Default;
+    auto& sw = switches[(size_t) (which == kCtl1 ? 0 : 1)];
+    const bool isChoice = tc.numChoices > 0;
+    k.slider.setVisible (! isChoice);
+    sw.setVisible (isChoice);
+    if (isChoice)
+    {
+        juce::StringArray names;
+        for (int i = 0; i < tc.numChoices; ++i) names.add (tc.choices[i]);
+        sw.setChoices (names);
+        sw.setTooltip (k.slider.getTooltip());
+    }
     if (tc.numChoices > 0)
     {
         k.slider.setRange (0.0, tc.numChoices - 1, 1.0);
@@ -204,7 +217,6 @@ void StepEditor::knobChanged (int which)
         {
             case kCtl1:   s.p1 = p; break;
             case kCtl2:   s.p2 = p; break;
-            case kLength: s.length = juce::roundToInt (v); break;
             case kLevel:  s.levelDb = (float) v; break;
             case kPan:    s.pan = (float) v; break;
             case kFilter: s.filter = (float) v; break;
@@ -263,7 +275,12 @@ void StepEditor::refresh (bool force)
     };
     setTypeKnob (kCtl1, s.p1);
     setTypeKnob (kCtl2, s.p2);
-    knobs[kLength].slider.setValue (s.length, juce::dontSendNotification);
+    for (int w = 0; w < 2; ++w)
+    {
+        const auto& tc = typeControl (w == 0 ? kCtl1 : kCtl2);
+        if (tc.numChoices > 0)
+            switches[(size_t) w].setIndex (gn::choiceIndex (w == 0 ? s.p1 : s.p2, tc.numChoices));
+    }
     knobs[kLevel].slider.setValue (s.levelDb, juce::dontSendNotification);
     knobs[kPan].slider.setValue (s.pan, juce::dontSendNotification);
     knobs[kFilter].slider.setValue (s.filter, juce::dontSendNotification);
@@ -271,7 +288,6 @@ void StepEditor::refresh (bool force)
     knobs[kRate].slider.setValue (s.rate, juce::dontSendNotification);
     knobs[kSend].slider.setValue (s.send, juce::dontSendNotification);
 
-    knobs[kLength].slider.setEnabled (! liveTarget); // a pad lasts as long as you hold it
     for (auto& k : knobs)
     {
         k.slider.updateText(); // readouts depend on the type, length and grid
@@ -302,8 +318,22 @@ void StepEditor::paint (juce::Graphics& g)
     }
     else
     {
-        g.setColour (current.on ? acid : dimText);
-        g.drawText ("STEP " + juce::String (step + 1) + "  " + typeName, header, juce::Justification::centredLeft);
+        // Is this step inside another step's tie? Then it's a layer on top of that glitch.
+        int owner = -1;
+        const auto pat = processor.getPattern (processor.getEditPattern());
+        for (int i = 0, n = processor.getNumSteps(); i < n; ++i)
+        {
+            const int len = std::min (pat[(size_t) i].length, n - i);
+            if (pat[(size_t) i].on && len > 1)
+            {
+                if (step > i && step < i + len) owner = i;
+                i += len - 1;
+            }
+        }
+        g.setColour (current.on ? (owner >= 0 ? nasty : acid) : dimText);
+        juce::String title = "STEP " + juce::String (step + 1) + "  " + typeName;
+        if (owner >= 0) title << "  (LAYER ON STEP " << (owner + 1) << ")";
+        g.drawText (title, header, juce::Justification::centredLeft);
 
         // How many repeats this step has room for: several controls only show with 2+.
         const double stepPpq = processor.getGridPpq() * (double) current.length;
@@ -323,7 +353,7 @@ void StepEditor::paint (juce::Graphics& g)
 
     // Dividers: type controls | shaping | crush & send
     g.setColour (outline);
-    for (int k : { kLength, kBits })
+    for (int k : { kLevel, kBits })
         g.drawVerticalLine (knobs[(size_t) k].label.getBounds().getX() - 3, (float) help.getBottom() + 6.0f, (float) getHeight() - 10.0f);
 }
 
@@ -335,4 +365,6 @@ void StepEditor::resized()
     const int w = r.getWidth() / kNumKnobs;
     for (int k = 0; k < kNumKnobs; ++k)
         knobs[(size_t) k].setBounds (r.removeFromLeft (w));
+    for (int w2 = 0; w2 < 2; ++w2)
+        switches[(size_t) w2].setBounds (knobs[(size_t) w2].slider.getBounds());
 }

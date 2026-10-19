@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 if(NOT DEFINED GN_VERSION)
-    set(GN_VERSION 0.3.0)   # CI passes 0.3.<build number>
+    set(GN_VERSION 0.4.0)   # CI passes 0.4.<build number>
 endif()
 project(GlitchNasty VERSION ${GN_VERSION} LANGUAGES C CXX)
 

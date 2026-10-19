@@ -83,7 +83,7 @@ constexpr TypeInfo kTypeInfo[kNumStutterTypes] = {
       "Loops a slice of the step until the step ends. Offset: which slice of the step gets looped. "
       "Variation: each repeat starts a little earlier, at random (humanized)." },
     { { "Mode", 2, { "Reverse", "Ping-Pong", nullptr } }, { "Offset", 0, {} }, 0.0f, 0.0f,
-      "Plays the slice backwards. Ping-Pong alternates backwards and forwards. Offset: which slice gets used." },
+      "Plays the slice backwards. Ping-Pong goes back to the start of the slice, then forward again, inside every repeat. Offset: which slice gets used." },
     { { "Duty", 0, {} }, { "Shape", 3, { "Hard", "Soft", "Pump" } }, 0.5f, 0.0f,
       "Chops the live signal on and off. Duty: how much of each cycle is open. "
       "Shape: hard edges, soft edges, or Pump (ducks then swells back, like sidechain)." },
@@ -140,8 +140,9 @@ inline double pingDecay (float p) noexcept    { return 1.0 - 0.6 * (double) clam
 inline double filterLpHz (float f) noexcept { return 20000.0 * std::pow (0.01, (double) std::clamp (-f, 0.0f, 1.0f)); }
 inline double filterHpHz (float f) noexcept { return 20.0 * std::pow (200.0, (double) std::clamp (f, 0.0f, 1.0f)); }
 
-// Crusher amounts (0 = off): bits 16 -> 1 (log), sample rate divided by 1 -> 64.
-inline double crushBits (float amt) noexcept       { return 16.0 * std::pow (1.0 / 16.0, (double) clamp01 (amt)); }
+// Crusher amounts (0 = off): bits 16 -> 1 spread evenly over the knob (halfway ~ 6 bits),
+// sample rate divided by 1 -> 64.
+inline double crushBits (float amt) noexcept       { return 1.0 + 15.0 * std::pow (1.0 - (double) clamp01 (amt), 1.6); }
 inline double crushRateFactor (float amt) noexcept { return std::pow (64.0, (double) clamp01 (amt)); }
 
 constexpr float kLevelMinDb = -30.0f, kLevelMaxDb = 6.0f;
@@ -248,8 +249,10 @@ inline PatternBank makeDefaultBank()
     E[0] = makeStep (T::pitch, kDiv16, 1.0f, 8);
     E[0].p1 = 0.5f;  // 0 st
     E[0].p2 = 1.0f;  // glide +24
+    E[4] = makeStep (T::roll, kDiv32);      // a layer: rolls the rising pitch
     E[8] = makeStep (T::pitch, kDiv32, 1.0f, 8);
     E[8].p2 = 0.0f;  // glide -24
+    E[12] = makeStep (T::reverse, kDiv64);  // a layer: reverses the falling pitch
 
     auto& F = b.patterns[5]; // textures
     F[0]  = makeStep (T::freeze, kDiv16, 1.0f, 4);

@@ -65,8 +65,17 @@ Patterns are saved with the session. Sessions from 0.1.x open with their old ste
 **Grid:** click a pad to switch a step on/off (drag to paint). Click the **type** or **repeat** box for a menu. Drag a
 **chance** bar (drag sideways to draw; double-click = 100 %). Click a step's **number** to edit it below.
 
-**Step editor:** two controls that depend on the type, then **Length** (tie the glitch over the following steps),
-**Level** (all the way down = mute), **Pan**, **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
+**Length (ties):** every on step has **[ ]** brackets at its edges - drag either one (the cursor turns into a resize
+arrow) to make the glitch last more or fewer steps. Dragging the left edge moves where it starts.
+
+**Layers (stacking):** inside a stretched step, click any covered step to switch on a **layer** (a pink block on the
+bar). It's a second glitch that plays on top of the long one *and processes it* - e.g. Pitch down over 4 steps with a
+Roll layer on step 3 rolls the pitched-down sound, then the pitch carries on underneath. Layers have their own type,
+repeat, chance and controls (click the step number to edit; the editor says "LAYER ON STEP n"), last one step, and
+stop when the stretched step ends. Pattern **E** shows it off.
+
+**Step editor:** two controls that depend on the type (knobs, or a switch when the control is a choice like
+Reverse/Ping-Pong or Speed Up/Slow Down), then **Level** (all the way down = mute), **Pan**, **Filter** (left = low-pass to 200 Hz, right = high-pass to 4 kHz;
 only on the glitch, never the dry signal), **Bits** and **Rate** (this glitch's crusher - set them per step to
 sequence the crush), and **Send** (how much of this glitch feeds the delay/reverb).
 Changes apply straight away, even to a glitch that's already playing (they glide over the X-Fade time, no clicks).
@@ -105,6 +114,10 @@ Pad settings are saved with the session.
 | Section | Controls |
 |---|---|
 | **Crush** (global) | **Bits** (off, 16 → 1 bit), **Rate** (off, ÷1 → ÷64 sample rate, aliasing on purpose), **Mix**. Crushes the whole output, dry included. For crush on just the glitches, use Bits/Rate in the step editor. |
+
+Both crushers quantise relative to the signal's level (a peak follower with a 250 ms release), so "4 bits" is
+4-bit crunch on a quiet guitar as much as on a loud drum bus - measured: no level drop at −6, −18 or −30 dBFS, and
+about 6 dB more crunch per bit lost.
 | **Delay** | **Time** (tempo-synced 1/32 … 1/2, dotted and triplet), **Feedback** (soft-clipped, so high settings stay musical), **Tone** (filter in the feedback loop: darker or thinner repeats), **Ping-Pong**, **Mix** (0 = off). |
 | **Reverb** | **Size** (room → huge hall, about 0.4–9 s), **Damp** (bright → dark), **Mix** (0 = off). An 8-line feedback delay network. |
 | **Send / Feed** | **Glitches**: only the glitched audio (times each step's Send) feeds the delay and reverb, so tails spill out of the glitches while the straight signal stays dry. **Everything**: the whole output. |
@@ -140,6 +153,7 @@ with that commit's notes. The version shows top-right in the plug-in window.
 - `Source/Params.h`: automatable parameter IDs (don't rename after release: it breaks sessions).
 - `Source/PluginProcessor.*`: JUCE wrapper, session save/load (and 0.1.x migration), pattern tools.
 - `Source/PluginEditor.*`, `StepGrid.*`, `StepEditor.*`, `PatternBar.*`, `LivePanel.*`, `FxPanel.*`, `Theme.h`: the UI.
+- Layers run in a second engine in series with the first (`GlitchCore.h`), so they process the tied glitch's output.
 - `tests/test_engine.cpp`: offline tests - grid/swing accuracy, every type and control, level/pan/filter, ties,
   chance/density/seed, MIDI live/quantize/pattern switch/footswitch, never-the-future across 132 setting combinations,
   click-free crossfades, block-size independence, bypasses, DAW loops, zero allocations on the audio thread,

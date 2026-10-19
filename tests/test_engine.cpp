@@ -591,7 +591,7 @@ static void testStepShaping()
         const auto bank = bankWith ([] (gn::Pattern& pat)
         {
             pat[0] = gn::makeStep (T::repeat, gn::kDiv32, 1.0f, 4);
-            for (int i = 1; i < 4; ++i) pat[(size_t) i] = gn::makeStep (T::reverse, gn::kDiv16);
+            for (int i = 1; i < 4; ++i) { pat[(size_t) i] = gn::makeStep (T::reverse, gn::kDiv16); pat[(size_t) i].on = false; }
         });
         const auto out = run (counterSignal (120000), p, bank);
         bool ok = true;
@@ -602,7 +602,7 @@ static void testStepShaping()
             ok &= std::abs ((double) out[n] - expect) < 0.01;
         }
         CHECK (ok, "Ties");
-        std::printf ("  Ties: one glitch runs across 4 steps; the covered steps stay silent\n");
+        std::printf ("  Ties: one glitch runs across 4 steps; covered steps that are off are skipped\n");
     }
 }
 
@@ -770,6 +770,10 @@ static void testSafety()
                                 pat[(size_t) i] = gn::makeStep ((T) t, div, 1.0f, len);
                                 pat[(size_t) i].p1 = pp.first;
                                 pat[(size_t) i].p2 = pp.second;
+                                // the next step is on too: inside a tie it becomes a layer on top
+                                pat[(size_t) i + 1] = gn::makeStep ((T) ((t + 3) % gn::kNumStutterTypes), gn::kDiv32);
+                                pat[(size_t) i + 1].p1 = pp.second;
+                                pat[(size_t) i + 1].p2 = pp.first;
                             }
                         });
                         const auto out = run (counter, p, bank);
@@ -779,7 +783,7 @@ static void testSafety()
                     }
         CHECK (bad == 0, "%d of %d runs read audio from the future", bad, runs);
         CHECK (gAllocCount == 0, "%d heap allocations on the audio path", gAllocCount.load());
-        std::printf ("  %d runs (every type x settings x ties x swing): never plays the future, no allocations\n", runs);
+        std::printf ("  %d runs (every type x settings x ties x layers x swing): never plays the future, no allocations\n", runs);
     }
 
     // No clicks with the default 3 ms crossfade (440 Hz sine, 1/32T: never lines up with the sine).
@@ -930,26 +934,40 @@ static void testFx()
 {
     std::printf ("Crusher / delay / reverb\n");
 
-    // Per-step crush: 4 bits -> at most 17 distinct levels; rate /8 -> values held 8 samples.
+    // Per-step crush. Rate /8: every value held for 8 samples. Bits: quiet material keeps its level
+    // (the quantiser follows the signal), and more crush = more distortion.
     {
         gn::CoreParams p;
         p.crossfadeMs = 0.0f;
-        auto bank = allSteps (T::repeat, gn::kDiv32);
-        for (auto& s : bank.patterns[0]) { s.bits = 0.5f; s.rate = 0.5f; } // 4 bits, /8
-        const auto out = run (sineSignal (48000, 220.0), p, bank);
-        std::vector<float> vals;
-        bool held = true;
-        for (size_t n = 24000; n < 30000; ++n)
-        {
-            vals.push_back (out[n]);
-        }
-        std::sort (vals.begin(), vals.end());
-        const auto distinct = std::unique (vals.begin(), vals.end()) - vals.begin();
+        auto rateOnly = allSteps (T::repeat, gn::kDiv32);
+        for (auto& s : rateOnly.patterns[0]) s.rate = 0.5f; // /8
+        const auto outR = run (sineSignal (48000, 220.0), p, rateOnly);
         int changes = 0;
-        for (size_t n = 24001; n < 30000; ++n) changes += out[n] != out[n - 1] ? 1 : 0;
-        held = changes <= 6000 / 8 + 2;
-        CHECK (distinct <= 17 && held, "crush: %d levels, %d changes in 6000 samples", (int) distinct, changes);
-        std::printf ("  Step crush 4 bit / rate /8: %d distinct levels, value changes every >= 8 samples\n", (int) distinct);
+        for (size_t n = 24001; n < 30000; ++n) changes += outR[n] != outR[n - 1] ? 1 : 0;
+        CHECK (changes <= 6000 / 8 + 2, "rate /8: %d value changes in 6000 samples", changes);
+
+        const auto quiet = [] { auto v = sineSignal (96000, 196.0); for (auto& x : v) x *= 0.0316f; return v; }(); // -30 dBFS
+        const auto clean = run (quiet, p, allSteps (T::repeat, gn::kDiv32));
+        double lastSnr = 1e9;
+        bool levelsOk = true, snrFalls = true;
+        std::printf ("  Step crush on a -30 dBFS tone (level change / signal-to-crush-noise):\n   ");
+        for (float amt : { 0.25f, 0.5f, 0.75f, 0.9f })
+        {
+            auto bank = allSteps (T::repeat, gn::kDiv32);
+            for (auto& s : bank.patterns[0]) s.bits = amt;
+            const auto out = run (quiet, p, bank);
+            double sig = 0, err = 0;
+            for (size_t n = 24000; n < 96000; ++n) { sig += (double) clean[n] * clean[n]; err += (double) (out[n] - clean[n]) * (out[n] - clean[n]); }
+            const double levelDb = 20.0 * std::log10 (rms (out, 24000, 96000) / rms (clean, 24000, 96000));
+            const double snr = 10.0 * std::log10 (sig / std::max (err, 1e-20));
+            std::printf (" %.1f bit: %+.1f dB / %.0f dB  ", gn::crushBits (amt), levelDb, snr);
+            levelsOk &= std::abs (levelDb) < 3.0;
+            snrFalls &= snr < lastSnr;
+            lastSnr = snr;
+        }
+        std::printf ("\n");
+        CHECK (levelsOk && snrFalls, "step crush: level drop or non-monotonic crush (levels ok %d, snr falls %d)", (int) levelsOk, (int) snrFalls);
+        std::printf ("  Step crush: no drop-outs on quiet material, more Bits = more crunch, Rate holds each value\n");
     }
 
     // Delay: an impulse comes back exactly one 1/8D later, then again at the feedback level; ping-pong alternates.
@@ -1012,23 +1030,23 @@ static void testFx()
         std::printf ("  Reverb: stereo, stable, decays %.0f dB over 3.2 s (design: %.0f dB)\n", decayDb, expectDb);
     }
 
-    // Global crusher on everything; FX at 0 is a true bypass even with everything else on.
+    // Global crusher on everything keeps quiet material's level; FX at 0 is a true bypass.
     {
         gn::CoreParams p;
-        p.crushBits = 0.75f; // 2 bits
+        p.crushBits = 0.9f; // ~1.4 bits
         p.crushMix = 1.0f;
         gn::PatternBank empty;
-        const auto in = sineSignal (48000, 200.0);
-        const auto out = run (in, p, empty, RunConfig { 48000.0, 120.0, true, true, 2, 480, {} });
-        std::vector<float> vals (out.begin() + 4800, out.end());
-        std::sort (vals.begin(), vals.end());
-        const auto distinct = std::unique (vals.begin(), vals.end()) - vals.begin();
-        CHECK (distinct <= 5, "global crusher: %d levels", (int) distinct);
+        auto quiet = sineSignal (48000, 200.0);
+        for (auto& x : quiet) x *= 0.0316f;
+        const auto out = run (quiet, p, empty, RunConfig { 48000.0, 120.0, true, true, 2, 480, {} });
+        const double levelDb = 20.0 * std::log10 (rms (out, 4800, 48000) / rms (quiet, 4800, 48000));
+        CHECK (std::abs (levelDb) < 3.0 && out != quiet, "global crusher level %.1f dB", levelDb);
 
         gn::CoreParams off;
         off.delayFeedback = 0.9f; off.reverbSize = 1.0f; off.fxSource = 1; off.crushBits = 1.0f; // all mixes at 0
+        const auto in = sineSignal (48000, 200.0);
         CHECK (run (in, off, empty) == in, "FX with mix 0 changed the audio");
-        std::printf ("  Global crusher (2 bit): %d levels; every FX at mix 0 = bit-identical\n", (int) distinct);
+        std::printf ("  Global crusher at ~1.4 bit on a -30 dBFS tone: level %+.1f dB (no drop-out); FX at mix 0 = bit-identical\n", levelDb);
     }
 
     // Everything on at once: no allocations, block-size independent.
@@ -1049,6 +1067,35 @@ static void testFx()
     }
 }
 
+//------------------------------------------------------------------------------
+// 11) Layers: a step inside a tie that's on stacks its glitch on top of the tied one.
+static void testLayers()
+{
+    std::printf ("Layers (stacked glitches inside a tie)\n");
+    gn::CoreParams p;
+    p.crossfadeMs = 0.0f;
+
+    // Step 1 = Pitch -12, tied over 4 steps (repeats of 1/16). Step 3 (inside the tie) = Repeat 1/32:
+    // it records what the Pitch glitch is playing and loops it - a roll of the pitched sound.
+    const auto bank = bankWith ([] (gn::Pattern& pat)
+    {
+        pat[0] = gn::makeStep (T::pitch, gn::kDiv16, 1.0f, 4);
+        pat[0].p1 = 0.25f; // -12 st
+        pat[2] = gn::makeStep (T::repeat, gn::kDiv32);
+    });
+    const auto out = run (counterSignal (30000), p, bank);
+    auto pitched = [] (size_t n) { return n < 6000 ? (double) n : 0.5 * (double) ((n - 6000) % 6000); };
+    bool ok = true;
+    for (size_t n = 0; n < 24000; ++n)
+    {
+        double expect = pitched (n);
+        if (n >= 15000 && n < 18000) expect = pitched (n - 3000); // the layer's repeat of the pitched audio
+        ok &= std::abs ((double) out[n] - expect) < 0.01;
+    }
+    CHECK (ok, "layer didn't stack on the tied glitch");
+    std::printf ("  Repeat inside a Pitch tie loops the pitched sound, then the tie carries on underneath\n");
+}
+
 int main()
 {
     testGridAccuracy (48000.0, 120.0, 2, gn::kDiv32, 0.5,  "48k, 120 BPM, grid 1/16, repeat 1/32");
@@ -1067,6 +1114,7 @@ int main()
     testSafety();
     testLiveControls();
     testFx();
+    testLayers();
 
     std::printf (gFailures == 0 ? "\nALL TESTS PASSED\n" : "\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;

@@ -109,6 +109,7 @@ public:
 
         mixSmoothingSamples = std::max (1, (int) (0.02 * sampleRate)); // 20 ms
         filterSmooth = (float) std::exp (-1.0 / (0.005 * sampleRate));  // 5 ms
+        crusher.prepare (sampleRate);
         reset();
     }
 
@@ -143,6 +144,8 @@ public:
         shapeRamp = 0;
         sendAmt = sendTarget = sendStep = 0.0f;
         sendRamp = 0;
+        actAmt = actTarget = actStep = 0.0f;
+        actRamp = 0;
         crushAmt = crushAmtT = 0.0f;
         crushBitsNow = 24.0;
         crushFactorNow = 1.0;
@@ -293,6 +296,7 @@ public:
         setFilterTarget (s.filter);
         LiveControls lc { p1, p2, level, pan, s.filter, s.bits, s.rate, s.send };
         setShaping (lc);
+        setActivityTarget (1.0f);
     }
 
     // Knob moves / automation while the glitch plays.
@@ -318,6 +322,7 @@ public:
         setFilterTarget (0.0f);
         fadeSamples = std::max (fadeSamplesForReturn, 0);
         setShaping (LiveControls { p1, p2, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f });
+        setActivityTarget (0.0f);
     }
 
     bool isStuttering() const noexcept { return stuttering; }
@@ -326,7 +331,8 @@ public:
 
     // Processes io[ch][start .. start+num) in place. If 'send' is given, the
     // glitch audio (times each step's Send) is written there for the delay/reverb.
-    void process (float* const* io, int numCh, int start, int num, float* const* send = nullptr) noexcept
+    // 'activity' (optional, mono) gets how much this engine is glitching, 0..1, per sample.
+    void process (float* const* io, int numCh, int start, int num, float* const* send = nullptr, float* activity = nullptr) noexcept
     {
         numCh = std::min (numCh, channels);
         constexpr double halfPi = 1.57079632679489661923;
@@ -374,13 +380,15 @@ public:
 
             const bool crushing = updateCrushSmoothing(); // always advance (never short-circuited)
             const bool shaping = crushing || shapeRamp > 0 || ! exactly (shape[0], 1.0f) || ! exactly (shape[1], 1.0f)
-                                 || sendRamp > 0 || ! exactly (sendAmt, 0.0f);
+                                 || sendRamp > 0 || ! exactly (sendAmt, 0.0f) || actRamp > 0 || ! exactly (actAmt, 0.0f);
 
             // 5) Fast path: nothing going on -> output == input, untouched (bit-identical).
             if (! stuttering && fadeRemaining == 0 && gateGain >= 1.0f && ! filterActive && ! shaping)
             {
                 if (send != nullptr)
                     for (int c = 0; c < numCh; ++c) send[c][i] = 0.0f;
+                if (activity != nullptr)
+                    activity[i] = 0.0f;
                 ++writeCount;
                 head = liveHead ((double) writeCount);
                 continue;
@@ -397,6 +405,13 @@ public:
                 sendAmt += sendStep;
                 if (--sendRamp == 0) sendAmt = sendTarget;
             }
+            if (actRamp > 0)
+            {
+                actAmt += actStep;
+                if (--actRamp == 0) actAmt = actTarget;
+            }
+            if (activity != nullptr)
+                activity[i] = actAmt;
 
             // 6) Loop point reached? Start the next repeat.
             if (stuttering && elapsed >= nextWrap)
@@ -788,6 +803,16 @@ private:
         crushStep = rampStep ((double) fadeSamples);
     }
 
+    void setActivityTarget (float t) noexcept
+    {
+        if (exactly (t, actTarget))
+            return;
+        actTarget = t;
+        if (fadeSamples <= 0) { actAmt = t; actRamp = 0; return; }
+        actRamp = fadeSamples;
+        actStep = (t - actAmt) / (float) fadeSamples;
+    }
+
     bool updateCrushSmoothing() noexcept
     {
         if (exactly (crushAmt, crushAmtT))
@@ -899,6 +924,8 @@ private:
     int shapeRamp = 0;
     float sendAmt = 0.0f, sendTarget = 0.0f, sendStep = 0.0f;
     int sendRamp = 0;
+    float actAmt = 0.0f, actTarget = 0.0f, actStep = 0.0f;
+    int actRamp = 0;
     float crushAmt = 0.0f, crushAmtT = 0.0f, crushStep = 1.0f;
     double crushBitsNow = 24.0, crushFactorNow = 1.0;
     Crusher crusher;

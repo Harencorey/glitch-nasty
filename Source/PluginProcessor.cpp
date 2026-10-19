@@ -194,6 +194,7 @@ void GlitchNastyProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     uiFiringStep.store (core.getFiringStep(), std::memory_order_relaxed);
     uiFiringLen.store (core.getFiringLength(), std::memory_order_relaxed);
     uiLiveType.store (core.getLiveType(), std::memory_order_relaxed);
+    uiLayerStep.store (core.getLayerStep(), std::memory_order_relaxed);
     uiPattern.store (core.getEffectivePattern(), std::memory_order_relaxed);
     uiEngaged.store (core.isEngaged(), std::memory_order_relaxed);
     uiEngagePending.store (core.isEngagePending(), std::memory_order_relaxed);
@@ -262,6 +263,31 @@ void GlitchNastyProcessor::editLiveStep (int type, const std::function<void (gn:
     change (s);
     s.type = juce::jlimit (0, gn::kNumStutterTypes - 1, type); // a pad's type never changes
     s.on = true;
+    publishBank (true);
+}
+
+void GlitchNastyProcessor::setStepSpan (int pattern, int oldStart, int newStart, int newEnd)
+{
+    const int n = getNumSteps();
+    const juce::ScopedLock sl (bankLock);
+    auto& pat = bank.patterns[(size_t) juce::jlimit (0, gn::kNumPatterns - 1, pattern)];
+    oldStart = juce::jlimit (0, n - 1, oldStart);
+    newEnd = juce::jlimit (0, n - 1, newEnd);
+    newStart = juce::jlimit (0, newEnd, newStart);
+
+    auto owner = pat[(size_t) oldStart];
+    const int oldEnd = oldStart + std::max (1, std::min (owner.length, n - oldStart)) - 1;
+
+    for (int j = oldStart + 1; j <= oldEnd; ++j) // layers left outside the new span would turn into normal steps
+        if (j < newStart || j > newEnd)
+            pat[(size_t) j].on = false;
+
+    if (newStart != oldStart)
+        pat[(size_t) oldStart].on = false; // its settings move to the new start
+
+    owner.on = true;
+    owner.length = newEnd - newStart + 1;
+    pat[(size_t) newStart] = owner;
     publishBank (true);
 }
 
